@@ -12,6 +12,7 @@ import time
 import hashlib
 import hmac
 import sqlite3
+import threading
 from collections import deque
 from functools import wraps
 from typing import List, Dict, Tuple, Optional
@@ -868,6 +869,68 @@ def list_subfolders(dir_abs: str) -> List[Dict]:
 VIDEO_INDEX: Dict[str, Dict] = {}
 VIDEO_INDEX_LAST_SCAN = 0.0
 VIDEO_INDEX_MIN_INTERVAL = 15.0
+VIDEO_INDEX_CACHE_PATH = os.path.join(VIDEO_ROOT, "video_index.json")
+VIDEO_INDEX_LOCK = threading.Lock()
+
+
+def apply_video_index(data: Dict[str, Dict]) -> None:
+    """Replace the in-memory index from a cached payload."""
+    global VIDEO_INDEX, AUTHOR_VIDEO_INDEX
+    new_index: Dict[str, Dict] = {}
+    author_map: Dict[str, List[str]] = {}
+    for rel, payload in (data or {}).items():
+        if not isinstance(payload, dict):
+            continue
+        entry = payload.copy()
+        entry.setdefault("path", rel)
+        if "duration" not in entry and entry.get("duration_seconds") is not None:
+            entry["duration"] = format_duration(entry.get("duration_seconds", 0.0))
+        new_index[rel] = entry
+        author = entry.get("author")
+        if author:
+            author_map.setdefault(author, []).append(rel)
+    VIDEO_INDEX = new_index
+    AUTHOR_VIDEO_INDEX = author_map
+    mark_popular_dirty()
+
+
+def persist_video_index() -> None:
+    """Persist the current index to disk so future boots start warm."""
+    payload = {"generated_at": time.time(), "videos": VIDEO_INDEX}
+    tmp_path = VIDEO_INDEX_CACHE_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp_path, VIDEO_INDEX_CACHE_PATH)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def load_video_index_cache() -> bool:
+    """Load a previously persisted index if present."""
+    if not os.path.exists(VIDEO_INDEX_CACHE_PATH):
+        return False
+    try:
+        with open(VIDEO_INDEX_CACHE_PATH, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        videos = payload.get("videos") if isinstance(payload, dict) else None
+        if isinstance(videos, dict):
+            apply_video_index(videos)
+            generated_at = payload.get("generated_at") if isinstance(payload, dict) else None
+            if isinstance(generated_at, (int, float)):
+                global VIDEO_INDEX_LAST_SCAN
+                VIDEO_INDEX_LAST_SCAN = generated_at
+            return True
+    except Exception:
+        pass
+    return False
+
+
+load_video_index_cache()
 
 
 def is_allowed_video_file(name: str) -> bool:
@@ -875,14 +938,30 @@ def is_allowed_video_file(name: str) -> bool:
 
 
 def iter_video_files(root_dir: str):
-    for dirpath, dirs, files in os.walk(root_dir):
-        rel_dir = os.path.relpath(dirpath, root_dir)
-        parts = [p for p in rel_dir.split(os.sep) if p not in (".", "")]
-        if any(part.startswith("__") for part in parts):
+    """Efficiently yield video files using scandir to minimize stat calls."""
+    stack = [os.path.abspath(root_dir)]
+    preview_abs = os.path.abspath(PREVIEW_ROOT)
+    upload_abs = os.path.abspath(UPLOAD_ROOT)
+    while stack:
+        current = stack.pop()
+        if current in (preview_abs, upload_abs):
             continue
-        for filename in files:
-            if is_allowed_video_file(filename):
-                yield os.path.join(dirpath, filename)
+        try:
+            with os.scandir(current) as iterator:
+                for entry in iterator:
+                    name = entry.name
+                    if name.startswith("__"):
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        if entry.is_file(follow_symlinks=False) and is_allowed_video_file(name):
+                            yield entry.path
+                    except FileNotFoundError:
+                        continue
+        except FileNotFoundError:
+            continue
 
 
 def refresh_video_index(force: bool = False) -> None:
@@ -890,77 +969,91 @@ def refresh_video_index(force: bool = False) -> None:
     now = time.time()
     if not force and (now - VIDEO_INDEX_LAST_SCAN) < VIDEO_INDEX_MIN_INTERVAL:
         return
-    VIDEO_INDEX_LAST_SCAN = now
-    seen: set = set()
-    author_map: Dict[str, List[str]] = {}
-    modified = False
-    for full_path in iter_video_files(VIDEO_ROOT):
-        rel = normalize_rel_path(os.path.relpath(full_path, VIDEO_ROOT))
-        seen.add(rel)
-        try:
-            stat = os.stat(full_path)
-        except FileNotFoundError:
-            continue
-        mtime = stat.st_mtime
-        size = stat.st_size
-        base = VIDEO_INDEX.get(rel)
-        needs_refresh = (
-            base is None
-            or base.get("mtime") != mtime
-            or base.get("size") != size
-        )
-        if needs_refresh:
-            duration_seconds = ffprobe_duration(full_path)
-            thumb = os.path.relpath(generate_thumbnail(full_path), VIDEO_ROOT).replace("\\", "/")
-            name = os.path.basename(full_path)
-            display_ru = translate_title_if_needed(name, "ru")
-            display_en = translate_title_if_needed(name, "en")
-            base = {
-                "name": name,
-                "path": rel,
-                "directory": normalize_rel_path(os.path.relpath(os.path.dirname(full_path), VIDEO_ROOT)),
-                "thumb": thumb,
-                "duration_seconds": duration_seconds,
-                "duration": format_duration(duration_seconds),
-                "author": extract_author(rel),
-                "mtime": mtime,
-                "size": size,
-                "display_ru": display_ru,
-                "display_en": display_en,
-                "search_key_ru": display_ru.lower(),
-                "search_key_en": display_en.lower(),
-            }
-            VIDEO_INDEX[rel] = base
-            modified = True
-        else:
-            if "display_ru" not in base:
-                display_ru = translate_title_if_needed(base["name"], "ru")
-                base["display_ru"] = display_ru
-                base["search_key_ru"] = display_ru.lower()
-            if "display_en" not in base:
-                display_en = translate_title_if_needed(base["name"], "en")
-                base["display_en"] = display_en
-                base["search_key_en"] = display_en.lower()
-            if "duration" not in base or "duration_seconds" not in base:
+    with VIDEO_INDEX_LOCK:
+        now = time.time()
+        if not force and (now - VIDEO_INDEX_LAST_SCAN) < VIDEO_INDEX_MIN_INTERVAL:
+            return
+        VIDEO_INDEX_LAST_SCAN = now
+        seen: set = set()
+        author_map: Dict[str, List[str]] = {}
+        modified = False
+        for full_path in iter_video_files(VIDEO_ROOT):
+            rel = normalize_rel_path(os.path.relpath(full_path, VIDEO_ROOT))
+            seen.add(rel)
+            try:
+                stat = os.stat(full_path)
+            except FileNotFoundError:
+                continue
+            mtime = stat.st_mtime
+            size = stat.st_size
+            base = VIDEO_INDEX.get(rel)
+            needs_refresh = (
+                base is None
+                or base.get("mtime") != mtime
+                or base.get("size") != size
+            )
+            if needs_refresh:
                 duration_seconds = ffprobe_duration(full_path)
-                base["duration_seconds"] = duration_seconds
-                base["duration"] = format_duration(duration_seconds)
-            if base.get("mtime") != mtime:
-                base["mtime"] = mtime
-            if base.get("size") != size:
-                base["size"] = size
-            if base.get("author") is None:
-                base["author"] = extract_author(rel)
-        author = base.get("author")
-        if author:
-            author_map.setdefault(author, []).append(rel)
-    for rel in list(VIDEO_INDEX.keys()):
-        if rel not in seen:
-            VIDEO_INDEX.pop(rel, None)
-            modified = True
-    AUTHOR_VIDEO_INDEX = author_map
-    if modified:
-        mark_popular_dirty()
+                thumb = os.path.relpath(generate_thumbnail(full_path), VIDEO_ROOT).replace("\\", "/")
+                name = os.path.basename(full_path)
+                display_ru = translate_title_if_needed(name, "ru")
+                display_en = translate_title_if_needed(name, "en")
+                base = {
+                    "name": name,
+                    "path": rel,
+                    "directory": normalize_rel_path(os.path.relpath(os.path.dirname(full_path), VIDEO_ROOT)),
+                    "thumb": thumb,
+                    "duration_seconds": duration_seconds,
+                    "duration": format_duration(duration_seconds),
+                    "author": extract_author(rel),
+                    "mtime": mtime,
+                    "size": size,
+                    "display_ru": display_ru,
+                    "display_en": display_en,
+                    "search_key_ru": display_ru.lower(),
+                    "search_key_en": display_en.lower(),
+                }
+                VIDEO_INDEX[rel] = base
+                modified = True
+            else:
+                base_modified = False
+                if "display_ru" not in base:
+                    display_ru = translate_title_if_needed(base["name"], "ru")
+                    base["display_ru"] = display_ru
+                    base["search_key_ru"] = display_ru.lower()
+                    base_modified = True
+                if "display_en" not in base:
+                    display_en = translate_title_if_needed(base["name"], "en")
+                    base["display_en"] = display_en
+                    base["search_key_en"] = display_en.lower()
+                    base_modified = True
+                if "duration" not in base or "duration_seconds" not in base:
+                    duration_seconds = ffprobe_duration(full_path)
+                    base["duration_seconds"] = duration_seconds
+                    base["duration"] = format_duration(duration_seconds)
+                    base_modified = True
+                if base.get("mtime") != mtime:
+                    base["mtime"] = mtime
+                    base_modified = True
+                if base.get("size") != size:
+                    base["size"] = size
+                    base_modified = True
+                if base.get("author") is None:
+                    base["author"] = extract_author(rel)
+                    base_modified = True
+                if base_modified:
+                    modified = True
+            author = base.get("author")
+            if author:
+                author_map.setdefault(author, []).append(rel)
+        for rel in list(VIDEO_INDEX.keys()):
+            if rel not in seen:
+                VIDEO_INDEX.pop(rel, None)
+                modified = True
+        AUTHOR_VIDEO_INDEX = author_map
+        if modified:
+            persist_video_index()
+            mark_popular_dirty()
 
 
 def base_display_name(base: Dict, lang: str) -> str:
@@ -2633,36 +2726,10 @@ def serve_file(filepath):
     full = safe_join(VIDEO_ROOT, filepath)
     if not os.path.exists(full): abort(404)
 
-    size = os.path.getsize(full)
-    range_header = request.headers.get("Range")
-    byte1, byte2 = 0, None
-
-    if range_header:
-        m = re.search(r"bytes=(\d+)-(\d*)", range_header)
-        if m:
-            g1, g2 = m.groups()
-            byte1 = int(g1)
-            if g2: byte2 = int(g2)
-
-    length = size - byte1
-    if byte2 is not None: length = byte2 - byte1 + 1
-
-    def generate_chunks(path, start, length, chunk=8192):
-        with open(path, "rb") as f:
-            f.seek(start)
-            remaining = length
-            while remaining > 0:
-                data = f.read(min(chunk, remaining))
-                if not data: break
-                remaining -= len(data)
-                yield data
-
-    status = 206 if range_header else 200
-    resp = Response(stream_with_context(generate_chunks(full, byte1, length)), status, mimetype="video/mp4", direct_passthrough=True)
-    resp.headers.add("Accept-Ranges", "bytes")
-    resp.headers.add("Content-Length", str(length))
-    if range_header:
-        resp.headers.add("Content-Range", f"bytes {byte1}-{byte1+length-1}/{size}")
+    resp = send_file(full, mimetype="video/mp4", conditional=True)
+    resp.headers["Accept-Ranges"] = "bytes"
+    # Disable default caching so updated files are fetched freshly
+    resp.headers.setdefault("Cache-Control", "no-store")
     return resp
 
 
@@ -2681,10 +2748,10 @@ def preview_file(filepath):
 # ---------- Dynamic TRANSCODE streaming & download ----------
 def stream_ffmpeg_process(cmd):
     """Yield ffmpeg stdout in chunks; kill on client disconnect."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=256 * 1024)
     try:
         while True:
-            chunk = proc.stdout.read(64*1024)
+            chunk = proc.stdout.read(256 * 1024)
             if not chunk:
                 break
             yield chunk
