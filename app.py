@@ -300,7 +300,8 @@ UI_TEXT = {
         "saved_ok": "Saved", "fixed_ok": "Checked / fixed", "like": "Like", "dislike": "Dislike",
         "locked": "Locked", "enter_pass": "Enter password", "open": "Open", "wrong_pass": "Wrong password",
         "quality": "Quality", "original": "Original", "login": "Login", "logout": "Logout",
-        "register": "Register", "account": "Account", "too_many_attempts": "Too many attempts, try later"
+        "register": "Register", "account": "Account", "too_many_attempts": "Too many attempts, try later",
+        "author": "Author", "recommendations": "Recommended for you"
     },
     "ru": {
         "root": "Корень", "categories": "Категории", "videos": "Видео",
@@ -314,7 +315,8 @@ UI_TEXT = {
         "saved_ok": "Сохранено", "fixed_ok": "Проверено/исправлено", "like": "Лайк", "dislike": "Дизлайк",
         "locked": "Закрыта", "enter_pass": "Введите пароль", "open": "Открыть", "wrong_pass": "Неверный пароль",
         "quality": "Качество", "original": "Оригинал", "login": "Войти", "logout": "Выйти",
-        "register": "Регистрация", "account": "Аккаунт", "too_many_attempts": "Слишком много попыток, попробуйте позже"
+        "register": "Регистрация", "account": "Аккаунт", "too_many_attempts": "Слишком много попыток, попробуйте позже",
+        "author": "Автор", "recommendations": "Рекомендации"
     }
 }
 
@@ -483,6 +485,48 @@ def get_lang() -> Tuple[str, Dict[str, str]]:
     return lang, UI_TEXT[lang]
 
 
+AUTHOR_SOURCES = [
+    "FROM",
+    "downloads/PornHub"
+]
+
+
+def normalize_rel_path(rel_path: str) -> str:
+    return rel_path.replace("\\", "/").strip("/")
+
+
+def extract_author(rel_path: str) -> Optional[str]:
+    normalized = normalize_rel_path(rel_path)
+    if not normalized:
+        return None
+    parts = normalized.split("/")
+    for prefix in AUTHOR_SOURCES:
+        prefix_parts = normalize_rel_path(prefix).split("/")
+        if parts[:len(prefix_parts)] == prefix_parts:
+            remainder = parts[len(prefix_parts):]
+            if prefix.upper() == "FROM" or not remainder:
+                return prefix_parts[-1]
+            candidate = remainder[0]
+            if "." in candidate and len(remainder) == 1:
+                return prefix_parts[-1]
+            if candidate:
+                return candidate
+            return prefix_parts[-1]
+    if parts:
+        first = parts[0]
+        if "." in first:
+            if len(parts) > 1 and "." not in parts[1]:
+                return parts[1]
+            return None
+        return first
+    return None
+
+
+def author_from_full_path(full_path: str) -> Optional[str]:
+    rel = os.path.relpath(full_path, VIDEO_ROOT)
+    return extract_author(rel)
+
+
 def get_user_cookie(resp=None) -> str:
     uid = request.cookies.get("uid")
     if uid:
@@ -647,12 +691,14 @@ def build_video_entry(full_path: str, lang: str) -> Optional[Dict]:
     display_name = translate_title_if_needed(name, lang)
     duration = format_duration(ffprobe_duration(full_path))
     thumb = os.path.relpath(generate_thumbnail(full_path), VIDEO_ROOT).replace("\\", "/")
+    author = extract_author(rel)
     return {
         "name": name,
         "display": display_name,
         "path": rel,
         "thumb": thumb,
-        "duration": duration
+        "duration": duration,
+        "author": author
     }
 
 
@@ -690,6 +736,39 @@ def list_all_videos(lang: str) -> List[Dict]:
         if entry:
             res.append(entry)
     return res
+
+
+def attach_secure_urls(videos: List[Dict]):
+    for v in videos:
+        sc = get_protected_root_for(v["path"])
+        v["watch_url"] = with_grant(url_for('watch_video', filepath=v['path']), sc)
+        v["thumb_url"] = with_grant(url_for('serve_file', filepath=v['thumb']), sc if sc else None)
+        v["preview_url"] = with_grant(url_for('preview_file', filepath=v['path']), sc if sc else None)
+
+
+def compute_recommendation_score(entry: Dict, current_author: Optional[str], current_dir_prefix: str) -> float:
+    score = 0.0
+    score += entry.get("views", 0) * 0.1
+    score += entry.get("likes", 0) * 3.0
+    score -= entry.get("dislikes", 0) * 1.5
+    score += entry.get("favorites", 0) * 5.0
+    if current_author and entry.get("author") == current_author:
+        score += 40.0
+    if current_dir_prefix and entry["path"].startswith(current_dir_prefix):
+        score += 20.0
+    score += random.random()
+    return score
+
+
+def recommend_videos(current_path: str, videos: List[Dict], current_author: Optional[str], current_dir_prefix: str, limit: int = 6) -> List[Dict]:
+    scored: List[Tuple[float, Dict]] = []
+    for entry in videos:
+        if entry["path"] == current_path:
+            continue
+        entry_copy = dict(entry)
+        scored.append((compute_recommendation_score(entry_copy, current_author, current_dir_prefix), entry_copy))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in scored[:limit]]
 
 
 def list_all_top_dirs() -> List[str]:
@@ -777,6 +856,26 @@ def reaction_counts(paths: List[str]) -> Dict[str, Dict[str, int]]:
     return res
 
 
+def favorite_counts(paths: List[str]) -> Dict[str, int]:
+    res = {p: 0 for p in paths}
+    if not paths:
+        return res
+    db = get_db()
+    placeholders = ",".join(["?"] * len(paths))
+    rows = db.execute(
+        f"""
+        SELECT video_path, COUNT(*) AS cnt
+        FROM favorites
+        WHERE video_path IN ({placeholders})
+        GROUP BY video_path
+        """,
+        paths
+    ).fetchall()
+    for row in rows:
+        res[row["video_path"]] = row["cnt"] or 0
+    return res
+
+
 def user_reaction_for(path: str) -> Optional[str]:
     if g.user is None:
         return None
@@ -799,15 +898,18 @@ def is_favorite(path: str) -> bool:
     return bool(row)
 
 
-def enrich_cards_with_stats(videos: List[Dict]):
+def enrich_cards_with_stats(videos: List[Dict], include_favorites: bool = False):
     paths = [v["path"] for v in videos]
     counts = reaction_counts(paths)
+    favs = favorite_counts(paths) if include_favorites else {}
     for v in videos:
         path = v["path"]
         c = counts.get(path, {"likes": 0, "dislikes": 0})
         v["views"] = _views.get(path, 0)
         v["likes"] = c.get("likes", 0)
         v["dislikes"] = c.get("dislikes", 0)
+        if include_favorites:
+            v["favorites"] = favs.get(path, 0)
 
 # -------------------------
 # TEMPLATES
@@ -871,6 +973,7 @@ h1{margin:0;font-weight:800;font-size:22px}
 .thumb, video.thumb{width:100%;aspect-ratio:16/9;object-fit:cover;display:block;border-radius:12px;background:#000}
 .dur{position:absolute;right:10px;bottom:10px;background:rgba(0,0,0,.7);color:#fff;padding:2px 6px;border-radius:8px;font-size:12px}
 .meta{display:flex;justify-content:center;gap:14px;margin:6px 0 2px;color:#9aa4b2;font-size:12px}
+.meta span.author{white-space:nowrap}
 .title{padding:6px 12px 12px;font-size:15px;text-align:center;font-weight:600;color:var(--text);min-height:46px;display:flex;align-items:center;justify-content:center}
 .muted{color:var(--muted)}
 .lock{font-size:12px;color:#9aa4b2;margin-left:6px}
@@ -908,6 +1011,7 @@ async function doSearch(q){
             <span>👁 ${v.views||0}</span>
             <span>👍 ${v.likes||0}</span>
             <span>👎 ${v.dislikes||0}</span>
+            <span class=\"author\">👤 ${v.author||'—'}</span>
           </div>
           <div class=\"title\">${v.display||v.name}</div>
         </a>
@@ -1017,6 +1121,7 @@ document.addEventListener('DOMContentLoaded',()=>{
               <span>👁 {{ v.get('views', 0) }}</span>
               <span>👍 {{ v.get('likes', 0) }}</span>
               <span>👎 {{ v.get('dislikes', 0) }}</span>
+              <span class=\"author\">👤 {{ v.get('author') or '—' }}</span>
             </div>
             <div class=\"title\">{{ v['display'] }}</div>
           </a>
@@ -1107,6 +1212,7 @@ h1{
 .card:hover{transform:translateY(-3px);box-shadow:0 6px 20px rgba(0,0,0,.45)}
 .thumb{width:100%;aspect-ratio:16/9;object-fit:cover;background:#000}
 .title{padding:8px 10px;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta-mini{padding:0 10px 10px;font-size:12px;color:var(--muted)}
 
 video {
   width:100%;
@@ -1157,6 +1263,7 @@ video {
     <button class="btn" id="dislike">👎 <span id="dislikes">{{ dislikes }}</span></button>
     <button class="btn" id="fav"><span id="favLabel">❤️ {% if fav %}★{% endif %}</span></button>
     <span class="badge">{{ duration }}</span>
+    <span class="badge">👤 {{ ui['author'] }}: {{ author or '—' }}</span>
   </div>
 
   <!-- 📂 Похожие видео из этой категории -->
@@ -1167,6 +1274,7 @@ video {
         <a href="{{ v['watch_url'] }}">
           <img class="thumb" src="{{ v['thumb_url'] }}" alt="{{ v['display'] }}">
           <div class="title">{{ v['display'] }}</div>
+          <div class="meta-mini">👤 {{ v.get('author') or '—' }}</div>
         </a>
       </div>
     {% endfor %}
@@ -1180,10 +1288,27 @@ video {
         <a href="{{ v['watch_url'] }}">
           <img class="thumb" src="{{ v['thumb_url'] }}" alt="{{ v['display'] }}">
           <div class="title">{{ v['display'] }}</div>
+          <div class="meta-mini">👤 {{ v.get('author') or '—' }}</div>
         </a>
       </div>
     {% endfor %}
   </div>
+
+  {% if recommended %}
+    <!-- 🔥 Рекомендации -->
+    <h2 style="margin-top:18px">🔥 {{ ui['recommendations'] }}</h2>
+    <div class="grid">
+      {% for v in recommended %}
+        <div class="card">
+          <a href="{{ v['watch_url'] }}">
+            <img class="thumb" src="{{ v['thumb_url'] }}" alt="{{ v['display'] }}">
+            <div class="title">{{ v['display'] }}</div>
+            <div class="meta-mini">👤 {{ v.get('author') or '—' }}</div>
+          </a>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
 </div>
 <script>
 (function(){
@@ -1341,6 +1466,7 @@ h1{margin:0 0 16px;font-weight:800}
 .card{background:#11151b;border-radius:12px;overflow:hidden}
 .thumb{width:100%;aspect-ratio:16/9;object-fit:cover;background:#000}
 .title{padding:10px 12px;text-align:center}
+.meta-mini{padding:0 12px 12px;text-align:center;color:#9aa4b2;font-size:12px}
 .muted{color:#9aa4b2}
 .notice{margin-bottom:16px}
 </style>
@@ -1360,6 +1486,7 @@ h1{margin:0 0 16px;font-weight:800}
                    poster="{{ v['thumb_url'] }}"
                    data-preview="{{ v['preview_url'] }}"></video>
             <div class="title">{{ v['display'] }}</div>
+            <div class="meta-mini">👤 {{ v.get('author') or '—' }}</div>
           </a>
         </div>
       {% endfor %}
@@ -1615,14 +1742,29 @@ def watch_video(filepath):
     current_dir_rel   = os.path.relpath(current_dir_abs, VIDEO_ROOT).replace("\\","/")
     current_dir_prefix= (current_dir_rel + "/") if current_dir_rel != "." else ""
 
+    current_author = extract_author(filepath)
+
     same_dir = [v for v in list_videos_in_dir(current_dir_abs, lang) if v["path"] != filepath]
-    enrich_cards_with_stats(same_dir)
-    related_same = random.sample(same_dir, min(5,len(same_dir))) if same_dir else []
+    enrich_cards_with_stats(same_dir, include_favorites=True)
+    related_same = random.sample(same_dir, min(5, len(same_dir))) if same_dir else []
+    attach_secure_urls(related_same)
 
     all_vids = list_all_videos(lang)
-    enrich_cards_with_stats(all_vids)
+    enrich_cards_with_stats(all_vids, include_favorites=True)
     global_pool = [v for v in all_vids if v["path"] != filepath and not (current_dir_prefix and v["path"].startswith(current_dir_prefix))]
-    related_global = random.sample(global_pool, min(5,len(global_pool))) if global_pool else []
+    related_global = random.sample(global_pool, min(5, len(global_pool))) if global_pool else []
+    attach_secure_urls(related_global)
+
+    used_paths = {v["path"] for v in related_same} | {v["path"] for v in related_global}
+    recommended_candidates = recommend_videos(filepath, all_vids, current_author, current_dir_prefix, limit=8)
+    recommended: List[Dict] = []
+    for entry in recommended_candidates:
+        if entry["path"] in used_paths:
+            continue
+        recommended.append(entry)
+        if len(recommended) >= 6:
+            break
+    attach_secure_urls(recommended)
 
     counts = reaction_counts([filepath]).get(filepath, {"likes": 0, "dislikes": 0})
     likes, dislikes = counts.get("likes", 0), counts.get("dislikes", 0)
@@ -1649,17 +1791,6 @@ def watch_video(filepath):
     download_original_name = f"{base_name}.mp4"
     download_height_names = {h: f"{base_name}_{h}p.mp4" for h in heights}
 
-    for v in related_same:
-        sc = get_protected_root_for(v['path'])
-        v["watch_url"]   = with_grant(url_for('watch_video', filepath=v['path']), sc)
-        v["thumb_url"]   = with_grant(url_for('serve_file', filepath=v['thumb']), sc if sc else None)
-        v["preview_url"] = with_grant(url_for('preview_file', filepath=v['path']), sc if sc else None)
-    for v in related_global:
-        sc = get_protected_root_for(v['path'])
-        v["watch_url"]   = with_grant(url_for('watch_video', filepath=v['path']), sc)
-        v["thumb_url"]   = with_grant(url_for('serve_file', filepath=v['thumb']), sc if sc else None)
-        v["preview_url"] = with_grant(url_for('preview_file', filepath=v['path']), sc if sc else None)
-
     html = render_template_string(
         TEMPLATE_VIDEO,
         video_name=video_name_disp, filepath=filepath, back_url=back_url, random_url=random_url,
@@ -1667,10 +1798,12 @@ def watch_video(filepath):
         download_original_name=download_original_name, download_height_names=download_height_names,
         delete_url=delete_url, checkfix_url=checkfix_url, heights=heights,
         is_admin=is_admin, related_same=related_same, related_global=related_global,
+        recommended=recommended,
         lang=lang, ui=ui, views=_views.get(filepath,0), likes=likes, dislikes=dislikes, fav=fav,
         duration=duration_disp, file_url=file_url, stream_base=stream_base,
         thumb_url=with_grant(url_for('serve_file', filepath=os.path.relpath(generate_thumbnail(full), VIDEO_ROOT).replace("\\","/")), scope if scope else None),
-        current_user=g.user, request_path=request.full_path if request.query_string else request.path
+        current_user=g.user, request_path=request.full_path if request.query_string else request.path,
+        author=current_author
     )
     resp.set_data(html)
     return resp
@@ -1984,15 +2117,10 @@ def favorites_page():
         except Exception:
             continue
         if os.path.isfile(full):
-            disp = translate_title_if_needed(os.path.basename(full), lang)
-            sc = get_protected_root_for(p)
-            items.append({
-                "path": p,
-                "display": disp,
-                "thumb_url": with_grant(url_for('serve_file', filepath=os.path.relpath(generate_thumbnail(full), VIDEO_ROOT).replace("\\","/")), sc if sc else None),
-                "preview_url": with_grant(url_for('preview_file', filepath=p), sc if sc else None),
-                "watch_url": with_grant(url_for('watch_video', filepath=p), sc)
-            })
+            entry = build_video_entry(full, lang)
+            if entry:
+                items.append(entry)
+    attach_secure_urls(items)
     html = render_template_string(TEMPLATE_FAVORITES, items=items, lang=lang, ui=ui, current_user=g.user)
     return html
 
