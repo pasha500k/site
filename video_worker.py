@@ -53,8 +53,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Video maintenance helper")
     parser.add_argument(
         "command",
+        nargs="?",
+        default="all",
         choices=["index", "previews", "all"],
-        help="Task to run: rebuild the metadata index, generate previews, or do both.",
+        help=(
+            "Task to run: rebuild the metadata index, generate previews, or do both. "
+            "Defaults to 'all' when omitted."
+        ),
     )
     parser.add_argument(
         "--workers",
