@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Single-file video site with account-backed likes and favorites."""
+import argparse
 import os
 import re
 import json
@@ -13,6 +14,7 @@ import hashlib
 import hmac
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from functools import wraps
 from typing import List, Dict, Tuple, Optional
@@ -3552,14 +3554,84 @@ def admin_delete(filepath):
 
 
 # -------------------------
-# START
+# CLI / STARTUP
 # -------------------------
-if __name__ == "__main__":
+
+
+def print_startup_banner() -> None:
     print(f"📂 Видео-каталог: {VIDEO_ROOT}")
     print(f"📂 Превью-каталог: {PREVIEW_ROOT}")
     print(f"🗂 Кэш: translations.json, durations.json, views.json, protected_folders.json")
     print(f"🗄️ SQLite: {DATABASE_PATH}")
     print(f"🔐 Admin username: {ADMIN_USERNAME}")
     print(f"🔏 Access token TTL: {ACCESS_TOKEN_TTL_SEC}s (HMAC in query)")
+
+
+def cli_rebuild_index() -> None:
+    print("[worker] refreshing metadata index…")
+    refresh_video_index(force=True)
+    mark_popular_dirty()
+    print("[worker] index refreshed.")
+
+
+def cli_generate_previews(workers: int) -> None:
+    refresh_video_index(force=True)
+    video_paths = list(iter_video_files(VIDEO_ROOT))
+    total = len(video_paths)
+    if not total:
+        print("[worker] nothing to do — no videos found.")
+        return
+    workers = max(1, workers)
+    print(f"[worker] generating previews for {total} videos using {workers} worker(s)…")
+
+    def task(path: str) -> None:
+        try:
+            ensure_preview(path)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            print(f"[worker] failed to generate preview for {path}: {exc}")
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for _ in executor.map(task, video_paths):
+            completed += 1
+            if completed % 25 == 0 or completed == total:
+                print(f"[worker] {completed}/{total} previews ready")
+    print("[worker] preview generation finished.")
+
+
+def run_server() -> None:
+    print_startup_banner()
     print("▶️ Запуск на http://0.0.0.0:8000")
     app.run(host="0.0.0.0", port=8000, debug=True)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Video site server and maintenance utilities")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["serve", "index", "previews", "all"],
+        help="Task to run: start the server (default), rebuild the index, generate previews, or run both maintenance tasks.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="Number of parallel workers when generating previews (default: CPU count).",
+    )
+    args = parser.parse_args(argv)
+
+    command = args.command or "serve"
+    if command == "serve":
+        run_server()
+        return 0
+
+    if command in {"index", "all"}:
+        cli_rebuild_index()
+    if command in {"previews", "all"}:
+        cli_generate_previews(args.workers)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entrypoint
+    raise SystemExit(main())
