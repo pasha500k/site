@@ -922,7 +922,8 @@ def list_videos_in_dir(dir_abs: str, lang: str) -> List[Dict]:
     refresh_video_index()
     rel_dir = normalize_rel_path(os.path.relpath(dir_abs, VIDEO_ROOT))
     results: List[Dict] = []
-    for base in VIDEO_INDEX.values():
+    # copy values to avoid "dictionary changed size" errors if the index refreshes mid-iteration
+    for base in list(VIDEO_INDEX.values()):
         if base.get("directory", "") != rel_dir:
             continue
         results.append(localized_video_entry(base, lang))
@@ -932,7 +933,8 @@ def list_videos_in_dir(dir_abs: str, lang: str) -> List[Dict]:
 
 def list_all_videos(lang: str) -> List[Dict]:
     refresh_video_index()
-    return [localized_video_entry(base, lang) for base in VIDEO_INDEX.values()]
+    # iterate over a snapshot so background refreshes do not mutate the dict during iteration
+    return [localized_video_entry(base, lang) for base in list(VIDEO_INDEX.values())]
 
 
 def attach_secure_urls(videos: List[Dict]):
