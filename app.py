@@ -43,6 +43,7 @@ ACCESS_SIGN_SECRET = (ADMIN_SECRET_PLAIN + "::access").encode("utf-8")
 ACCESS_TOKEN_TTL_SEC = 10 * 60  # 10 минут
 
 DATABASE_PATH = os.path.join(VIDEO_ROOT, "app.db")
+SQLITE_MAX_VARIABLES = 999
 
 os.makedirs(PREVIEW_ROOT, exist_ok=True)
 os.makedirs(UPLOAD_ROOT, exist_ok=True)
@@ -653,6 +654,15 @@ def sanitize_filename(name: str, default: str = "video") -> str:
     return clean_base + (ext or ".mp4")
 
 
+def chunked_list(items: List[str], size: int):
+    if size <= 0 or not items:
+        if items:
+            yield items
+        return
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
 def extract_author(rel_path: str) -> Optional[str]:
     normalized = normalize_rel_path(rel_path)
     if not normalized:
@@ -1034,24 +1044,28 @@ def reaction_counts(paths: List[str]) -> Dict[str, Dict[str, int]]:
     res = {p: {"likes": 0, "dislikes": 0} for p in paths}
     if not paths:
         return res
+    unique_paths = list(dict.fromkeys(paths))
     db = get_db()
-    placeholders = ",".join(["?"] * len(paths))
-    rows = db.execute(
-        f"""
-        SELECT video_path,
-               SUM(CASE WHEN reaction='like' THEN 1 ELSE 0 END) AS likes,
-               SUM(CASE WHEN reaction='dislike' THEN 1 ELSE 0 END) AS dislikes
-        FROM reactions
-        WHERE video_path IN ({placeholders})
-        GROUP BY video_path
-        """,
-        paths
-    ).fetchall()
-    for row in rows:
-        res[row["video_path"]] = {
-            "likes": row["likes"] or 0,
-            "dislikes": row["dislikes"] or 0
-        }
+    for chunk in chunked_list(unique_paths, SQLITE_MAX_VARIABLES):
+        if not chunk:
+            continue
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = db.execute(
+            f"""
+            SELECT video_path,
+                   SUM(CASE WHEN reaction='like' THEN 1 ELSE 0 END) AS likes,
+                   SUM(CASE WHEN reaction='dislike' THEN 1 ELSE 0 END) AS dislikes
+            FROM reactions
+            WHERE video_path IN ({placeholders})
+            GROUP BY video_path
+            """,
+            chunk
+        ).fetchall()
+        for row in rows:
+            res[row["video_path"]] = {
+                "likes": row["likes"] or 0,
+                "dislikes": row["dislikes"] or 0
+            }
     return res
 
 
@@ -1059,19 +1073,23 @@ def favorite_counts(paths: List[str]) -> Dict[str, int]:
     res = {p: 0 for p in paths}
     if not paths:
         return res
+    unique_paths = list(dict.fromkeys(paths))
     db = get_db()
-    placeholders = ",".join(["?"] * len(paths))
-    rows = db.execute(
-        f"""
-        SELECT video_path, COUNT(*) AS cnt
-        FROM favorites
-        WHERE video_path IN ({placeholders})
-        GROUP BY video_path
-        """,
-        paths
-    ).fetchall()
-    for row in rows:
-        res[row["video_path"]] = row["cnt"] or 0
+    for chunk in chunked_list(unique_paths, SQLITE_MAX_VARIABLES):
+        if not chunk:
+            continue
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = db.execute(
+            f"""
+            SELECT video_path, COUNT(*) AS cnt
+            FROM favorites
+            WHERE video_path IN ({placeholders})
+            GROUP BY video_path
+            """,
+            chunk
+        ).fetchall()
+        for row in rows:
+            res[row["video_path"]] = row["cnt"] or 0
     return res
 
 
