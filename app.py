@@ -15,6 +15,7 @@ import sqlite3
 from collections import deque
 from functools import wraps
 from typing import List, Dict, Tuple, Optional
+import uuid
 
 from flask import (
     Flask, render_template_string, request, url_for, abort,
@@ -31,6 +32,7 @@ app.config["SECRET_KEY"] = os.environ.get("APP_SECRET_KEY", "change-me")
 # -------------------------
 VIDEO_ROOT    = r"C:\Users\pavel\PycharmProjects\PH_Dowloader_TG+WEB\downloads"
 PREVIEW_ROOT  = os.path.join(VIDEO_ROOT, "__previews__")
+UPLOAD_ROOT   = os.path.join(VIDEO_ROOT, "__uploads__")
 ALLOWED_EXT   = {".mp4"}
 
 ADMIN_SECRET_PLAIN = os.environ.get("ADMIN_DEFAULT_PASSWORD", "Hehetoto123")
@@ -43,6 +45,7 @@ ACCESS_TOKEN_TTL_SEC = 10 * 60  # 10 минут
 DATABASE_PATH = os.path.join(VIDEO_ROOT, "app.db")
 
 os.makedirs(PREVIEW_ROOT, exist_ok=True)
+os.makedirs(UPLOAD_ROOT, exist_ok=True)
 os.makedirs(VIDEO_ROOT, exist_ok=True)
 
 # -------------------------
@@ -104,6 +107,7 @@ def init_db():
                 username TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 is_admin INTEGER NOT NULL DEFAULT 0,
+                is_moderator INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS reactions (
@@ -136,9 +140,50 @@ def init_db():
                 PRIMARY KEY(user_id, folder_path),
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS user_stats (
+                user_id INTEGER PRIMARY KEY,
+                views_count INTEGER NOT NULL DEFAULT 0,
+                seconds_watched REAL NOT NULL DEFAULT 0,
+                last_view_at TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS uploads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                stored_name TEXT NOT NULL,
+                original_name TEXT NOT NULL,
+                target_folder TEXT NOT NULL,
+                final_path TEXT,
+                status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected')) DEFAULT 'pending',
+                moderator_id INTEGER,
+                notes TEXT,
+                size_bytes INTEGER,
+                duration_seconds REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(moderator_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status);
             """
         )
         conn.commit()
+        def has_column(table: str, column: str) -> bool:
+            cur = conn.execute(f"PRAGMA table_info({table})")
+            return any(row[1] == column for row in cur.fetchall())
+
+        if not has_column("users", "is_moderator"):
+            conn.execute("ALTER TABLE users ADD COLUMN is_moderator INTEGER NOT NULL DEFAULT 0")
+
+        if not has_column("uploads", "final_path"):
+            conn.execute("ALTER TABLE uploads ADD COLUMN final_path TEXT")
+        if not has_column("uploads", "target_folder"):
+            conn.execute("ALTER TABLE uploads ADD COLUMN target_folder TEXT NOT NULL DEFAULT 'community'")
+        if not has_column("uploads", "duration_seconds"):
+            conn.execute("ALTER TABLE uploads ADD COLUMN duration_seconds REAL")
+        if not has_column("uploads", "size_bytes"):
+            conn.execute("ALTER TABLE uploads ADD COLUMN size_bytes INTEGER")
+
         cur = conn.execute("SELECT id FROM users WHERE is_admin=1 LIMIT 1")
         if cur.fetchone() is None:
             conn.execute(
@@ -196,7 +241,24 @@ def viewer_identity(resp=None) -> Tuple[str, Optional[int]]:
     return f"anon:{uid}", None
 
 
-def register_view_if_new(video_path: str, resp=None) -> bool:
+def _upsert_user_stats(db: sqlite3.Connection, user_id: int, duration_seconds: float) -> None:
+    if user_id is None:
+        return
+    seconds = max(float(duration_seconds or 0), 0.0)
+    db.execute(
+        """
+        INSERT INTO user_stats (user_id, views_count, seconds_watched, last_view_at)
+        VALUES (?, 1, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            views_count = views_count + 1,
+            seconds_watched = seconds_watched + excluded.seconds_watched,
+            last_view_at = CURRENT_TIMESTAMP
+        """,
+        (user_id, seconds)
+    )
+
+
+def register_view_if_new(video_path: str, resp=None, duration_seconds: Optional[float] = None) -> bool:
     fingerprint, user_id = viewer_identity(resp)
     db = get_db()
     row = db.execute(
@@ -209,6 +271,8 @@ def register_view_if_new(video_path: str, resp=None) -> bool:
         "INSERT INTO view_events (fingerprint, video_path, user_id) VALUES (?, ?, ?)",
         (fingerprint, video_path, user_id)
     )
+    if user_id is not None and duration_seconds is not None:
+        _upsert_user_stats(db, user_id, duration_seconds)
     db.commit()
     return True
 
@@ -265,10 +329,16 @@ def load_logged_in_user():
     if user_id is not None:
         db = get_db()
         row = db.execute(
-            "SELECT id, username, is_admin FROM users WHERE id = ?", (user_id,)
+            "SELECT id, username, is_admin, is_moderator FROM users WHERE id = ?",
+            (user_id,)
         ).fetchone()
         if row:
-            g.user = {"id": row["id"], "username": row["username"], "is_admin": bool(row["is_admin"])}
+            g.user = {
+                "id": row["id"],
+                "username": row["username"],
+                "is_admin": bool(row["is_admin"]),
+                "is_moderator": bool(row["is_moderator"])
+            }
         else:
             session.clear()
 
@@ -278,6 +348,24 @@ def login_required(view):
     def wrapped_view(**kwargs):
         if g.user is None:
             return redirect(url_for("login", next=request.url))
+        return view(**kwargs)
+    return wrapped_view
+
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped_view(**kwargs):
+        if g.user is None or not g.user.get("is_admin"):
+            abort(403)
+        return view(**kwargs)
+    return wrapped_view
+
+
+def moderator_required(view):
+    @wraps(view)
+    def wrapped_view(**kwargs):
+        if g.user is None or not is_moderator_request():
+            abort(403)
         return view(**kwargs)
     return wrapped_view
 
@@ -301,7 +389,24 @@ UI_TEXT = {
         "locked": "Locked", "enter_pass": "Enter password", "open": "Open", "wrong_pass": "Wrong password",
         "quality": "Quality", "original": "Original", "login": "Login", "logout": "Logout",
         "register": "Register", "account": "Account", "too_many_attempts": "Too many attempts, try later",
-        "author": "Author", "recommendations": "Recommended for you"
+        "author": "Author", "recommendations": "Recommended for you", "upload": "Upload",
+        "account_stats": "Stats", "admin_panel": "Admin panel", "moderator_panel": "Moderator panel",
+        "pending_uploads": "Pending uploads", "approve": "Approve", "reject": "Reject", "notes": "Notes",
+        "target_folder": "Target folder", "status_pending": "Pending", "status_approved": "Approved",
+        "status_rejected": "Rejected", "moderator": "Moderator", "user": "User",
+        "role_admin": "Admin", "role_moderator": "Moderator", "role_user": "User",
+        "user_stats": "User statistics", "total_views": "Total views", "minutes_watched": "Minutes watched",
+        "average_watch": "Average minutes per view", "no_data": "No data yet", "uploads": "Uploads",
+        "submit_upload": "Submit upload", "select_file": "Select video", "choose_folder": "Choose folder",
+        "upload_success": "Upload submitted for review", "upload_error": "Failed to upload",
+        "upload_rules": "Videos must be in MP4 format", "view_file": "Download file",
+        "assign_moderators": "Manage moderators", "make_moderator": "Make moderator",
+        "manage_protected": "Protected folders",
+        "remove_moderator": "Remove moderator", "stats_summary": "Summary", "total_videos": "Videos",
+        "total_users": "Users", "favorites_count": "Favorites saved", "uploads_pending": "Pending",
+        "uploads_approved": "Approved", "uploads_rejected": "Rejected", "upload_history": "Your uploads",
+        "moderation_notes": "Moderation notes", "minutes_short": "minutes", "views_count": "Views",
+        "avg_minutes": "Average minutes", "last_view": "Last view"
     },
     "ru": {
         "root": "Корень", "categories": "Категории", "videos": "Видео",
@@ -316,7 +421,26 @@ UI_TEXT = {
         "locked": "Закрыта", "enter_pass": "Введите пароль", "open": "Открыть", "wrong_pass": "Неверный пароль",
         "quality": "Качество", "original": "Оригинал", "login": "Войти", "logout": "Выйти",
         "register": "Регистрация", "account": "Аккаунт", "too_many_attempts": "Слишком много попыток, попробуйте позже",
-        "author": "Автор", "recommendations": "Рекомендации"
+        "author": "Автор", "recommendations": "Рекомендации", "upload": "Загрузить",
+        "account_stats": "Статистика", "admin_panel": "Панель админа", "moderator_panel": "Панель модератора",
+        "pending_uploads": "Ожидают модерации", "approve": "Одобрить", "reject": "Отклонить",
+        "notes": "Комментарий", "target_folder": "Папка назначения", "status_pending": "Ожидает",
+        "status_approved": "Одобрено", "status_rejected": "Отклонено", "moderator": "Модератор",
+        "user": "Пользователь", "role_admin": "Админ", "role_moderator": "Модератор",
+        "role_user": "Пользователь", "user_stats": "Статистика пользователей", "total_views": "Всего просмотров",
+        "minutes_watched": "Минут просмотрено", "average_watch": "Среднее минут за просмотр",
+        "no_data": "Нет данных", "uploads": "Загрузки", "submit_upload": "Отправить",
+        "select_file": "Выберите видео", "choose_folder": "Выберите папку",
+        "upload_success": "Видео отправлено на модерацию", "upload_error": "Не удалось загрузить",
+        "upload_rules": "Видео должно быть в формате MP4", "view_file": "Скачать файл",
+        "assign_moderators": "Управление модераторами", "make_moderator": "Назначить модератором",
+        "manage_protected": "Защищённые папки",
+        "remove_moderator": "Снять модератора", "stats_summary": "Сводка", "total_videos": "Видео",
+        "total_users": "Пользователи", "favorites_count": "Добавлено в избранное",
+        "uploads_pending": "На модерации", "uploads_approved": "Одобрено", "uploads_rejected": "Отклонено",
+        "upload_history": "Ваши загрузки", "moderation_notes": "Комментарий модератора",
+        "minutes_short": "минут", "views_count": "Просмотры", "avg_minutes": "Среднее (мин)",
+        "last_view": "Последний просмотр"
     }
 }
 
@@ -468,6 +592,13 @@ def is_admin_request(req=None) -> bool:
     return False
 
 
+def is_moderator_request() -> bool:
+    user = getattr(g, "user", None)
+    if not user:
+        return False
+    return bool(user.get("is_admin") or user.get("is_moderator"))
+
+
 # -------------------------
 # UTILITIES
 # -------------------------
@@ -492,7 +623,34 @@ AUTHOR_SOURCES = [
 
 
 def normalize_rel_path(rel_path: str) -> str:
-    return rel_path.replace("\\", "/").strip("/")
+    if not rel_path:
+        return ""
+    normalized = rel_path.replace("\\", "/").strip()
+    normalized = normalized.strip("/")
+    if normalized == ".":
+        return ""
+    return normalized
+
+
+def sanitize_folder_name(folder: str) -> str:
+    normalized = normalize_rel_path(folder)
+    if not normalized:
+        return "community"
+    parts = []
+    for part in normalized.split("/"):
+        clean = re.sub(r"[^0-9A-Za-z _-]+", "_", part).strip(" _")
+        if not clean:
+            continue
+        if clean.startswith("__"):
+            clean = clean.lstrip("_") or "folder"
+        parts.append(clean)
+    return "/".join(parts) if parts else "community"
+
+
+def sanitize_filename(name: str, default: str = "video") -> str:
+    base, ext = os.path.splitext(name)
+    clean_base = re.sub(r"[^0-9A-Za-z _-]+", "_", base).strip(" _") or default
+    return clean_base + (ext or ".mp4")
 
 
 def extract_author(rel_path: str) -> Optional[str]:
@@ -677,65 +835,104 @@ def list_subfolders(dir_abs: str) -> List[Dict]:
     return res
 
 
+VIDEO_INDEX: Dict[str, Dict] = {}
+VIDEO_INDEX_LAST_SCAN = 0.0
+VIDEO_INDEX_MIN_INTERVAL = 15.0
+
+
 def is_allowed_video_file(name: str) -> bool:
     return os.path.splitext(name)[1].lower() in ALLOWED_EXT
-
-
-def build_video_entry(full_path: str, lang: str) -> Optional[Dict]:
-    if not os.path.isfile(full_path):
-        return None
-    name = os.path.basename(full_path)
-    if not is_allowed_video_file(name):
-        return None
-    rel = os.path.relpath(full_path, VIDEO_ROOT).replace("\\", "/")
-    display_name = translate_title_if_needed(name, lang)
-    duration = format_duration(ffprobe_duration(full_path))
-    thumb = os.path.relpath(generate_thumbnail(full_path), VIDEO_ROOT).replace("\\", "/")
-    author = extract_author(rel)
-    return {
-        "name": name,
-        "display": display_name,
-        "path": rel,
-        "thumb": thumb,
-        "duration": duration,
-        "author": author
-    }
-
-
-def list_videos_in_dir(dir_abs: str, lang: str) -> List[Dict]:
-    res: List[Dict] = []
-    if not os.path.isdir(dir_abs):
-        return res
-    for name in os.listdir(dir_abs):
-        if name.startswith("__"):
-            continue
-        full = os.path.join(dir_abs, name)
-        if os.path.isdir(full):
-            continue
-        entry = build_video_entry(full, lang)
-        if entry:
-            res.append(entry)
-    res.sort(key=lambda x: x["display"].lower())
-    return res
 
 
 def iter_video_files(root_dir: str):
     for dirpath, dirs, files in os.walk(root_dir):
         rel_dir = os.path.relpath(dirpath, root_dir)
-        if "__previews__" in rel_dir.split(os.sep):
+        parts = [p for p in rel_dir.split(os.sep) if p not in (".", "")]
+        if any(part.startswith("__") for part in parts):
             continue
         for filename in files:
             if is_allowed_video_file(filename):
                 yield os.path.join(dirpath, filename)
 
 
-def list_all_videos(lang: str) -> List[Dict]:
-    res: List[Dict] = []
+def refresh_video_index(force: bool = False) -> None:
+    global VIDEO_INDEX_LAST_SCAN
+    now = time.time()
+    if not force and (now - VIDEO_INDEX_LAST_SCAN) < VIDEO_INDEX_MIN_INTERVAL:
+        return
+    VIDEO_INDEX_LAST_SCAN = now
+    seen: set = set()
     for full_path in iter_video_files(VIDEO_ROOT):
-        entry = build_video_entry(full_path, lang)
-        if entry:
-            res.append(entry)
-    return res
+        rel = normalize_rel_path(os.path.relpath(full_path, VIDEO_ROOT))
+        seen.add(rel)
+        try:
+            stat = os.stat(full_path)
+        except FileNotFoundError:
+            continue
+        mtime = stat.st_mtime
+        size = stat.st_size
+        entry = VIDEO_INDEX.get(rel)
+        if entry and entry.get("mtime") == mtime and entry.get("size") == size:
+            continue
+        duration_seconds = ffprobe_duration(full_path)
+        thumb = os.path.relpath(generate_thumbnail(full_path), VIDEO_ROOT).replace("\\", "/")
+        VIDEO_INDEX[rel] = {
+            "name": os.path.basename(full_path),
+            "path": rel,
+            "directory": normalize_rel_path(os.path.relpath(os.path.dirname(full_path), VIDEO_ROOT)),
+            "thumb": thumb,
+            "duration_seconds": duration_seconds,
+            "duration": format_duration(duration_seconds),
+            "author": extract_author(rel),
+            "mtime": mtime,
+            "size": size,
+        }
+    for rel in list(VIDEO_INDEX.keys()):
+        if rel not in seen:
+            VIDEO_INDEX.pop(rel, None)
+
+
+def localized_video_entry(base: Dict, lang: str) -> Dict:
+    display_name = translate_title_if_needed(base["name"], lang)
+    entry = {
+        "name": base["name"],
+        "display": display_name,
+        "path": base["path"],
+        "thumb": base["thumb"],
+        "duration": base["duration"],
+        "author": base.get("author"),
+        "duration_seconds": base.get("duration_seconds", 0.0),
+    }
+    return entry
+
+
+def build_video_entry(full_path: str, lang: str) -> Optional[Dict]:
+    rel = normalize_rel_path(os.path.relpath(full_path, VIDEO_ROOT))
+    refresh_video_index()
+    base = VIDEO_INDEX.get(rel)
+    if base is None:
+        refresh_video_index(force=True)
+        base = VIDEO_INDEX.get(rel)
+        if base is None:
+            return None
+    return localized_video_entry(base, lang)
+
+
+def list_videos_in_dir(dir_abs: str, lang: str) -> List[Dict]:
+    refresh_video_index()
+    rel_dir = normalize_rel_path(os.path.relpath(dir_abs, VIDEO_ROOT))
+    results: List[Dict] = []
+    for base in VIDEO_INDEX.values():
+        if base.get("directory", "") != rel_dir:
+            continue
+        results.append(localized_video_entry(base, lang))
+    results.sort(key=lambda x: x["display"].lower())
+    return results
+
+
+def list_all_videos(lang: str) -> List[Dict]:
+    refresh_video_index()
+    return [localized_video_entry(base, lang) for base in VIDEO_INDEX.values()]
 
 
 def attach_secure_urls(videos: List[Dict]):
@@ -965,6 +1162,9 @@ h1{margin:0;font-weight:800;font-size:22px}
 .button{background:var(--accent);color:#fff;border:0;padding:11px 14px;border-radius:12px;text-decoration:none;display:inline-flex;gap:8px;align-items:center;box-shadow:var(--shadow);transition:.25s}
 .button:hover{background:var(--accent2);transform:scale(1.03)}
 .lang{background:#30363d}
+.logout-btn{background:#dc3545}
+.logout-btn:hover{background:#ff4757}
+.user-badge{display:inline-flex;align-items:center;gap:6px;padding:10px 12px;border-radius:12px;background:#1c2129;color:var(--text);font-weight:600;box-shadow:var(--shadow)}
 .section-title{margin:18px 0 10px;font-size:18px;font-weight:800}
 .grid{display:grid;gap:22px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
 .card{background:var(--card);border-radius:16px;overflow:hidden;transition:.25s;box-shadow:var(--shadow)}
@@ -1072,12 +1272,20 @@ document.addEventListener('DOMContentLoaded',()=>{
       <input class=\"input\" placeholder=\"{{ ui['search_placeholder'] }}\" oninput=\"doSearch(this.value)\">
       <a class=\"button\" href=\"{{ url_for('random_video') }}\">🎲 {{ ui['random'] }}</a>
       <a class=\"button\" href=\"{{ url_for('random_settings') }}\">🎛 {{ ui['random_settings'] }}</a>
-      <a class=\"button\" href=\"{{ url_for('favorites_page') }}\">❤️ {{ ui['favorites'] }}</a>
       {% if current_user %}
-        <span class=\"badge\">{{ ui['account'] }}: {{ current_user['username'] }}</span>
-        <a class=\"button\" href=\"{{ url_for('logout') }}\">🚪 {{ ui['logout'] }}</a>
+        <span class=\"user-badge\">👤 {{ current_user['username'] }}</span>
+        <a class=\"button\" href=\"{{ url_for('upload_video') }}\">⬆️ {{ ui['upload'] }}</a>
+        <a class=\"button\" href=\"{{ url_for('account_stats') }}\">📊 {{ ui['account_stats'] }}</a>
+        <a class=\"button\" href=\"{{ url_for('favorites_page') }}\">❤️ {{ ui['favorites'] }}</a>
+        {% if current_user['is_admin'] %}
+          <a class=\"button\" href=\"{{ url_for('admin_panel') }}\">🛠 {{ ui['admin_panel'] }}</a>
+          <a class=\"button\" href=\"{{ url_for('moderator_panel') }}\">🛡 {{ ui['moderator_panel'] }}</a>
+        {% elif current_user['is_moderator'] %}
+          <a class=\"button\" href=\"{{ url_for('moderator_panel') }}\">🛡 {{ ui['moderator_panel'] }}</a>
+        {% endif %}
+        <a class=\"button logout-btn\" href=\"{{ url_for('logout') }}\">🚪 {{ ui['logout'] }}</a>
       {% else %}
-        <a class=\"button\" href=\"{{ url_for('login') }}\">🔐 {{ ui['login'] }}</a>
+        <a class=\"button\" href=\"{{ url_for('login') }}\">🔑 {{ ui['login'] }}</a>
         <a class=\"button\" href=\"{{ url_for('register') }}\">🆕 {{ ui['register'] }}</a>
       {% endif %}
       <a class=\"button lang\" href=\"{{ url_for('set_lang', code=('en' if lang=='ru' else 'ru')) }}\">{{ ui['lang_btn'] }}</a>
@@ -1185,9 +1393,12 @@ h1{
   transition:.2s;
 }
 .btn:hover{background:#2a3440}
+.btn.logout{background:#dc3545}
+.btn.logout:hover{background:#ff4757}
 .btn.del{background:#dc3545}
 .btn.del:hover{background:#ff4757}
 .badge{color:var(--muted)}
+.user-chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:10px;background:#1c2129;color:#e6edf3;border:1px solid #2a3440;font-weight:600}
 .stats{
   display:flex;
   gap:14px;
@@ -1241,10 +1452,19 @@ video {
       <a class="btn del" href="{{ delete_url }}" onclick="return confirm('Delete? / Удалить?')">🗑 {{ ui['delete'] }}</a>
     {% endif %}
     {% if current_user %}
-      <span class="btn" style="pointer-events:none;">{{ ui['account'] }}: {{ current_user['username'] }}</span>
-      <a class="btn" href="{{ url_for('logout', next=request_path) }}">🚪 {{ ui['logout'] }}</a>
+      <span class="user-chip">👤 {{ current_user['username'] }}</span>
+      <a class="btn" href="{{ url_for('upload_video') }}">⬆️ {{ ui['upload'] }}</a>
+      <a class="btn" href="{{ url_for('account_stats') }}">📊 {{ ui['account_stats'] }}</a>
+      <a class="btn" href="{{ url_for('favorites_page') }}">❤️ {{ ui['favorites'] }}</a>
+      {% if current_user['is_admin'] %}
+        <a class="btn" href="{{ url_for('admin_panel') }}">🛠 {{ ui['admin_panel'] }}</a>
+        <a class="btn" href="{{ url_for('moderator_panel') }}">🛡 {{ ui['moderator_panel'] }}</a>
+      {% elif current_user['is_moderator'] %}
+        <a class="btn" href="{{ url_for('moderator_panel') }}">🛡 {{ ui['moderator_panel'] }}</a>
+      {% endif %}
+      <a class="btn logout" href="{{ url_for('logout', next=request_path) }}">🚪 {{ ui['logout'] }}</a>
     {% else %}
-      <a class="btn" href="{{ url_for('login', next=request_path) }}">🔐 {{ ui['login'] }}</a>
+      <a class="btn" href="{{ url_for('login', next=request_path) }}">🔑 {{ ui['login'] }}</a>
       <a class="btn" href="{{ url_for('register', next=request_path) }}">🆕 {{ ui['register'] }}</a>
     {% endif %}
   </div>
@@ -1499,6 +1719,405 @@ h1{margin:0 0 16px;font-weight:800}
 </html>
 """
 
+
+TEMPLATE_UPLOAD = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>⬆️ {{ ui['upload'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:"Inter","Segoe UI",Arial,sans-serif;margin:0}
+.container{max-width:900px;margin:auto;padding:26px}
+h1{margin:0 0 16px;font-weight:800}
+form{display:grid;gap:14px;background:#11151b;padding:18px;border-radius:12px}
+label{display:flex;flex-direction:column;gap:6px;font-size:14px}
+input[type=file],select,input[type=text]{background:#151b23;color:#e6edf3;border:1px solid #2a3440;border-radius:10px;padding:10px}
+button{background:#238636;color:#fff;border:0;padding:10px 14px;border-radius:10px;cursor:pointer}
+button:hover{background:#2ea043}
+.muted{color:#9aa4b2;font-size:13px}
+.alert{padding:12px 14px;border-radius:10px;margin-bottom:12px}
+.alert.ok{background:#102820;color:#7ee787}
+.alert.err{background:#2c1515;color:#ffa198}
+table{width:100%;border-collapse:collapse;margin-top:20px;background:#11151b;border-radius:12px;overflow:hidden}
+th,td{padding:10px;border-bottom:1px solid #1f2630;text-align:left;font-size:14px}
+th{background:#151b23}
+.status{font-weight:600}
+.status.pending{color:#f1c40f}
+.status.approved{color:#2ecc71}
+.status.rejected{color:#e74c3c}
+.toolbar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+.btn{background:#222b35;color:#e6edf3;padding:8px 12px;border-radius:10px;text-decoration:none}
+.btn:hover{background:#2a3440}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="toolbar">
+    <a class="btn" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
+    <a class="btn" href="{{ url_for('account_stats') }}">📊 {{ ui['account_stats'] }}</a>
+    {% if current_user and current_user['is_admin'] %}
+      <a class="btn" href="{{ url_for('admin_panel') }}">🛠 {{ ui['admin_panel'] }}</a>
+    {% elif current_user and current_user['is_moderator'] %}
+      <a class="btn" href="{{ url_for('moderator_panel') }}">🛡 {{ ui['moderator_panel'] }}</a>
+    {% endif %}
+  </div>
+  <h1>⬆️ {{ ui['upload'] }}</h1>
+  {% if message %}<div class="alert ok">{{ message }}</div>{% endif %}
+  {% if error %}<div class="alert err">{{ error }}</div>{% endif %}
+  <form method="post" enctype="multipart/form-data">
+    <label>
+      {{ ui['select_file'] }}
+      <input type="file" name="video" accept="video/mp4" required>
+    </label>
+    <label>
+      {{ ui['choose_folder'] }}
+      <select name="target_folder">
+        <option value="">community</option>
+        {% for d in top_dirs %}
+          <option value="{{ d }}" {% if d == default_folder %}selected{% endif %}>{{ d }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      Custom
+      <input type="text" name="custom_folder" placeholder="uploads/my-folder">
+    </label>
+    <button type="submit">✅ {{ ui['submit_upload'] }}</button>
+    <div class="muted">{{ ui['upload_rules'] }}</div>
+  </form>
+
+  <h2 style="margin-top:22px">📜 {{ ui['upload_history'] }}</h2>
+  {% if history %}
+    <table>
+      <tr>
+        <th>{{ ui['videos'] }}</th>
+        <th>{{ ui['target_folder'] }}</th>
+        <th>{{ ui['status_pending'] }}</th>
+        <th>{{ ui['notes'] }}</th>
+        <th>🕒</th>
+      </tr>
+      {% for item in history %}
+        {% set status_class = 'status ' + item['status'] %}
+        {% if item['status'] == 'pending' %}
+          {% set status_label = ui['status_pending'] %}
+        {% elif item['status'] == 'approved' %}
+          {% set status_label = ui['status_approved'] %}
+        {% else %}
+          {% set status_label = ui['status_rejected'] %}
+        {% endif %}
+        <tr>
+          <td>{{ item['original_name'] }}</td>
+          <td>{{ item['target_folder'] or 'community' }}</td>
+          <td class="{{ status_class }}">{{ status_label }}</td>
+          <td>{{ item['notes'] or '' }}</td>
+          <td>{{ item['created_at'] }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">{{ ui['no_data'] }}</p>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
+
+TEMPLATE_ACCOUNT_STATS = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>📊 {{ ui['account_stats'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:"Inter","Segoe UI",Arial,sans-serif;margin:0}
+.container{max-width:960px;margin:auto;padding:26px}
+h1{margin:0 0 18px;font-weight:800}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
+.card{background:#11151b;border-radius:12px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+.card h3{margin:0 0 8px;font-size:16px}
+.value{font-size:26px;font-weight:800}
+.muted{color:#9aa4b2;font-size:14px}
+table{width:100%;border-collapse:collapse;margin-top:20px;background:#11151b;border-radius:12px;overflow:hidden}
+th,td{padding:10px;border-bottom:1px solid #1f2630;text-align:left}
+th{background:#151b23}
+.toolbar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+.btn{background:#222b35;color:#e6edf3;padding:8px 12px;border-radius:10px;text-decoration:none}
+.btn:hover{background:#2a3440}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="toolbar">
+    <a class="btn" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
+    <a class="btn" href="{{ url_for('upload_video') }}">⬆️ {{ ui['upload'] }}</a>
+    {% if current_user and current_user['is_admin'] %}
+      <a class="btn" href="{{ url_for('admin_panel') }}">🛠 {{ ui['admin_panel'] }}</a>
+    {% elif current_user and current_user['is_moderator'] %}
+      <a class="btn" href="{{ url_for('moderator_panel') }}">🛡 {{ ui['moderator_panel'] }}</a>
+    {% endif %}
+  </div>
+  <h1>📊 {{ ui['account_stats'] }}</h1>
+  <div class="cards">
+    <div class="card"><h3>{{ ui['views_count'] }}</h3><div class="value">{{ stats.views }}</div></div>
+    <div class="card"><h3>{{ ui['minutes_watched'] }}</h3><div class="value">{{ stats.minutes }}</div><div class="muted">{{ ui['minutes_short'] }}</div></div>
+    <div class="card"><h3>{{ ui['avg_minutes'] }}</h3><div class="value">{{ stats.avg }}</div></div>
+    <div class="card"><h3>{{ ui['favorites'] }}</h3><div class="value">{{ stats.favorites }}</div></div>
+  </div>
+  <div class="muted" style="margin-top:10px">{{ ui['last_view'] }}: {{ stats.last_view or '—' }}</div>
+
+  <h2 style="margin-top:24px">📦 {{ ui['uploads'] }}</h2>
+  <div class="cards">
+    <div class="card"><h3>{{ ui['uploads_pending'] }}</h3><div class="value">{{ uploads_counts.pending }}</div></div>
+    <div class="card"><h3>{{ ui['uploads_approved'] }}</h3><div class="value">{{ uploads_counts.approved }}</div></div>
+    <div class="card"><h3>{{ ui['uploads_rejected'] }}</h3><div class="value">{{ uploads_counts.rejected }}</div></div>
+  </div>
+
+  <h2 style="margin-top:24px">📜 {{ ui['upload_history'] }}</h2>
+  {% if uploads %}
+    <table>
+      <tr>
+        <th>{{ ui['videos'] }}</th>
+        <th>{{ ui['target_folder'] }}</th>
+        <th>{{ ui['status_pending'] }}</th>
+        <th>{{ ui['notes'] }}</th>
+        <th>🕒</th>
+      </tr>
+      {% for item in uploads %}
+        {% if item['status'] == 'pending' %}
+          {% set status_label = ui['status_pending'] %}
+        {% elif item['status'] == 'approved' %}
+          {% set status_label = ui['status_approved'] %}
+        {% else %}
+          {% set status_label = ui['status_rejected'] %}
+        {% endif %}
+        <tr>
+          <td>{{ item['original_name'] }}</td>
+          <td>{{ item['target_folder'] or 'community' }}</td>
+          <td>{{ status_label }}</td>
+          <td>{{ item['notes'] or '' }}</td>
+          <td>{{ item['created_at'] }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">{{ ui['no_data'] }}</p>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
+
+TEMPLATE_ADMIN_PANEL = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>🛠 {{ ui['admin_panel'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:"Inter","Segoe UI",Arial,sans-serif;margin:0}
+.container{max-width:1100px;margin:auto;padding:26px}
+h1{margin:0 0 16px;font-weight:800}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-bottom:20px}
+.card{background:#11151b;border-radius:12px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+.card h3{margin:0 0 8px;font-size:15px}
+.value{font-size:24px;font-weight:800}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.btn{background:#222b35;color:#e6edf3;padding:8px 12px;border-radius:10px;text-decoration:none}
+.btn:hover{background:#2a3440}
+table{width:100%;border-collapse:collapse;margin-top:18px;background:#11151b;border-radius:12px;overflow:hidden}
+th,td{padding:10px;border-bottom:1px solid #1f2630;text-align:left;font-size:14px}
+th{background:#151b23}
+form.inline{display:inline}
+textarea{width:100%;min-height:60px;background:#151b23;color:#e6edf3;border:1px solid #2a3440;border-radius:10px;padding:8px}
+input[type=text],select{background:#151b23;color:#e6edf3;border:1px solid #2a3440;border-radius:10px;padding:8px}
+button{background:#238636;color:#fff;border:0;padding:8px 12px;border-radius:10px;cursor:pointer}
+button:hover{background:#2ea043}
+.danger{background:#dc3545}
+.danger:hover{background:#ff4757}
+.status{font-weight:600}
+.status.pending{color:#f1c40f}
+.status.approved{color:#2ecc71}
+.status.rejected{color:#e74c3c}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="toolbar">
+    <a class="btn" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
+    <a class="btn" href="{{ url_for('upload_video') }}">⬆️ {{ ui['upload'] }}</a>
+    <a class="btn" href="{{ url_for('admin_protect') }}">🔐 {{ ui['manage_protected'] }}</a>
+  </div>
+  <h1>🛠 {{ ui['admin_panel'] }}</h1>
+  <div class="grid">
+    <div class="card"><h3>{{ ui['total_videos'] }}</h3><div class="value">{{ summary.videos }}</div></div>
+    <div class="card"><h3>{{ ui['total_users'] }}</h3><div class="value">{{ summary.users }}</div></div>
+    <div class="card"><h3>{{ ui['pending_uploads'] }}</h3><div class="value">{{ summary.pending }}</div></div>
+  </div>
+
+  <h2>👥 {{ ui['assign_moderators'] }}</h2>
+  <table>
+    <tr><th>{{ ui['user'] }}</th><th>{{ ui['role_admin'] }}</th><th>{{ ui['role_moderator'] }}</th><th>{{ ui['views_count'] }}</th><th>{{ ui['minutes_watched'] }}</th><th>{{ ui['favorites'] }}</th><th>{{ ui['last_view'] }}</th><th></th></tr>
+    {% for user in users %}
+      <tr>
+        <td>{{ user.username }}</td>
+        <td>{{ '✅' if user.is_admin else '—' }}</td>
+        <td>{{ '✅' if user.is_moderator else '—' }}</td>
+        <td>{{ user.views }}</td>
+        <td>{{ user.minutes }}</td>
+        <td>{{ user.favorites }}</td>
+        <td>{{ user.last_view or '—' }}</td>
+        <td>
+          {% if not user.is_admin %}
+            <form class="inline" method="post" action="{{ url_for('toggle_moderator', user_id=user.id) }}">
+              <input type="hidden" name="next" value="{{ request.path }}">
+              {% if user.is_moderator %}
+                <button type="submit" name="action" value="demote" class="danger">{{ ui['remove_moderator'] }}</button>
+              {% else %}
+                <button type="submit" name="action" value="promote">{{ ui['make_moderator'] }}</button>
+              {% endif %}
+            </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+  </table>
+
+  <h2 style="margin-top:28px">⏳ {{ ui['pending_uploads'] }}</h2>
+  {% if pending_uploads %}
+    <table>
+      <tr><th>ID</th><th>{{ ui['videos'] }}</th><th>{{ ui['user'] }}</th><th>{{ ui['target_folder'] }}</th><th>MB</th><th>🕒</th><th></th></tr>
+      {% for item in pending_uploads %}
+        <tr>
+          <td>{{ item['id'] }}</td>
+          <td>{{ item['original_name'] }}</td>
+          <td>{{ item['username'] }}</td>
+          <td>{{ item['target_folder'] }}</td>
+          <td>{{ '%.1f'|format(item['size_mb']) }}</td>
+          <td>{{ item['created_at'] }}</td>
+          <td>
+            <a class="btn" href="{{ url_for('download_pending_upload', upload_id=item['id']) }}">{{ ui['view_file'] }}</a>
+            <form class="inline" method="post" action="{{ url_for('approve_upload', upload_id=item['id']) }}">
+              <input type="hidden" name="next" value="{{ request.path }}">
+              <input type="text" name="target_folder" value="{{ item['target_folder'] }}" placeholder="{{ ui['target_folder'] }}">
+              <input type="text" name="notes" placeholder="{{ ui['notes'] }}">
+              <button type="submit">{{ ui['approve'] }}</button>
+            </form>
+            <form class="inline" method="post" action="{{ url_for('reject_upload', upload_id=item['id']) }}" onsubmit="return confirm('Reject upload?');">
+              <input type="hidden" name="next" value="{{ request.path }}">
+              <input type="text" name="notes" placeholder="{{ ui['notes'] }}">
+              <button type="submit" class="danger">{{ ui['reject'] }}</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">{{ ui['no_data'] }}</p>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
+
+TEMPLATE_MOD_PANEL = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>🛡 {{ ui['moderator_panel'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:"Inter","Segoe UI",Arial,sans-serif;margin:0}
+.container{max-width:1000px;margin:auto;padding:26px}
+h1{margin:0 0 16px;font-weight:800}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.btn{background:#222b35;color:#e6edf3;padding:8px 12px;border-radius:10px;text-decoration:none}
+.btn:hover{background:#2a3440}
+table{width:100%;border-collapse:collapse;background:#11151b;border-radius:12px;overflow:hidden}
+th,td{padding:10px;border-bottom:1px solid #1f2630;text-align:left;font-size:14px}
+th{background:#151b23}
+form.inline{display:inline}
+input[type=text]{background:#151b23;color:#e6edf3;border:1px solid #2a3440;border-radius:10px;padding:8px}
+button{background:#238636;color:#fff;border:0;padding:8px 12px;border-radius:10px;cursor:pointer}
+button:hover{background:#2ea043}
+.danger{background:#dc3545}
+.danger:hover{background:#ff4757}
+.muted{color:#9aa4b2}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="toolbar">
+    <a class="btn" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
+    {% if current_user and current_user['is_admin'] %}
+      <a class="btn" href="{{ url_for('admin_panel') }}">🛠 {{ ui['admin_panel'] }}</a>
+    {% endif %}
+  </div>
+  <h1>🛡 {{ ui['moderator_panel'] }}</h1>
+  <h2>{{ ui['pending_uploads'] }}</h2>
+  {% if pending_uploads %}
+    <table>
+      <tr><th>ID</th><th>{{ ui['videos'] }}</th><th>{{ ui['user'] }}</th><th>{{ ui['target_folder'] }}</th><th>MB</th><th>🕒</th><th></th></tr>
+      {% for item in pending_uploads %}
+        <tr>
+          <td>{{ item['id'] }}</td>
+          <td>{{ item['original_name'] }}</td>
+          <td>{{ item['username'] }}</td>
+          <td>{{ item['target_folder'] }}</td>
+          <td>{{ '%.1f'|format(item['size_mb']) }}</td>
+          <td>{{ item['created_at'] }}</td>
+          <td>
+            <a class="btn" href="{{ url_for('download_pending_upload', upload_id=item['id']) }}">{{ ui['view_file'] }}</a>
+            <form class="inline" method="post" action="{{ url_for('approve_upload', upload_id=item['id']) }}">
+              <input type="hidden" name="next" value="{{ request.path }}">
+              <input type="text" name="target_folder" value="{{ item['target_folder'] }}" placeholder="{{ ui['target_folder'] }}">
+              <input type="text" name="notes" placeholder="{{ ui['notes'] }}">
+              <button type="submit">{{ ui['approve'] }}</button>
+            </form>
+            <form class="inline" method="post" action="{{ url_for('reject_upload', upload_id=item['id']) }}" onsubmit="return confirm('Reject upload?');">
+              <input type="hidden" name="next" value="{{ request.path }}">
+              <input type="text" name="notes" placeholder="{{ ui['notes'] }}">
+              <button type="submit" class="danger">{{ ui['reject'] }}</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">{{ ui['no_data'] }}</p>
+  {% endif %}
+
+  <h2 style="margin-top:24px">✅ {{ ui['uploads_approved'] }}</h2>
+  {% if recent_reviews %}
+    <table>
+      <tr><th>{{ ui['videos'] }}</th><th>{{ ui['status_pending'] }}</th><th>{{ ui['notes'] }}</th><th>🕒</th></tr>
+      {% for item in recent_reviews %}
+        {% if item['status'] == 'approved' %}
+          {% set status_label = ui['status_approved'] %}
+        {% elif item['status'] == 'rejected' %}
+          {% set status_label = ui['status_rejected'] %}
+        {% else %}
+          {% set status_label = ui['status_pending'] %}
+        {% endif %}
+        <tr>
+          <td>{{ item['original_name'] }}</td>
+          <td>{{ status_label }}</td>
+          <td>{{ item['notes'] or '' }}</td>
+          <td>{{ item['reviewed_at'] or item['created_at'] }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">{{ ui['no_data'] }}</p>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
 TEMPLATE_PROTECT = """<!doctype html>
 <html lang="ru">
 <head>
@@ -1734,7 +2353,9 @@ def watch_video(filepath):
 
     resp = make_response()
 
-    if register_view_if_new(filepath, resp):
+    video_duration_seconds = ffprobe_duration(full)
+
+    if register_view_if_new(filepath, resp, video_duration_seconds):
         _views[filepath] = _views.get(filepath, 0) + 1
         save_views()
 
@@ -1774,7 +2395,7 @@ def watch_video(filepath):
     fav = is_favorite(filepath)
 
     video_name_disp = translate_title_if_needed(os.path.basename(full), lang)
-    duration_disp   = format_duration(ffprobe_duration(full))
+    duration_disp   = format_duration(video_duration_seconds)
 
     file_url         = with_grant(url_for('serve_file', filepath=filepath), scope)
     back_url         = with_grant(url_for('browse', subpath=os.path.dirname(filepath)), scope)
@@ -2124,34 +2745,343 @@ def favorites_page():
     html = render_template_string(TEMPLATE_FAVORITES, items=items, lang=lang, ui=ui, current_user=g.user)
     return html
 
+
+@app.route("/upload", methods=["GET", "POST"])
+@login_required
+def upload_video():
+    lang, ui = get_lang()
+    db = get_db()
+    message = None
+    error = None
+    top_dirs = list_all_top_dirs()
+    if "community" not in top_dirs:
+        top_dirs.append("community")
+    top_dirs = sorted(set(top_dirs), key=str.lower)
+    default_folder = "community"
+
+    if request.method == "POST":
+        if not allow_rate("upload", 5, 3600):
+            error = ui["too_many_attempts"]
+        else:
+            file = request.files.get("video")
+            if not file or not file.filename:
+                error = ui["upload_error"]
+            else:
+                ext = os.path.splitext(file.filename)[1].lower()
+                if ext not in ALLOWED_EXT:
+                    error = ui["upload_error"]
+                else:
+                    target_folder = request.form.get("target_folder", "") or "community"
+                    custom_folder = request.form.get("custom_folder", "").strip()
+                    if custom_folder:
+                        target_folder = custom_folder
+                    target_folder = sanitize_folder_name(target_folder)
+                    stored_name = f"{int(time.time())}_{g.user['id']}_{uuid.uuid4().hex[:8]}{ext}"
+                    stored_path = os.path.join(UPLOAD_ROOT, stored_name)
+                    original_name = sanitize_filename(file.filename)
+                    try:
+                        file.save(stored_path)
+                        size_bytes = os.path.getsize(stored_path)
+                        db.execute(
+                            "INSERT INTO uploads (user_id, stored_name, original_name, target_folder, status, size_bytes) "
+                            "VALUES (?, ?, ?, ?, 'pending', ?)",
+                            (g.user["id"], stored_name, original_name, target_folder, size_bytes)
+                        )
+                        db.commit()
+                        message = ui["upload_success"]
+                        default_folder = target_folder.split("/")[0] if target_folder else "community"
+                    except Exception:
+                        error = ui["upload_error"]
+                        try:
+                            if os.path.exists(stored_path):
+                                os.remove(stored_path)
+                        except Exception:
+                            pass
+
+    history_rows = db.execute(
+        "SELECT id, original_name, target_folder, status, notes, created_at "
+        "FROM uploads WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+        (g.user["id"],)
+    ).fetchall()
+    history = [dict(row) for row in history_rows]
+
+    return render_template_string(
+        TEMPLATE_UPLOAD,
+        lang=lang, ui=ui, message=message, error=error,
+        top_dirs=top_dirs, history=history, default_folder=default_folder,
+        current_user=g.user
+    )
+
+
+@app.route("/account/stats")
+@login_required
+def account_stats():
+    lang, ui = get_lang()
+    db = get_db()
+    stats_row = db.execute(
+        "SELECT views_count, seconds_watched, last_view_at FROM user_stats WHERE user_id = ?",
+        (g.user["id"],)
+    ).fetchone()
+    views = stats_row["views_count"] if stats_row else 0
+    seconds = stats_row["seconds_watched"] if stats_row else 0.0
+    minutes = seconds / 60.0
+    avg = (minutes / views) if views else 0.0
+    favorites = db.execute(
+        "SELECT COUNT(*) FROM favorites WHERE user_id = ?",
+        (g.user["id"],)
+    ).fetchone()[0]
+    uploads_counts = {"pending": 0, "approved": 0, "rejected": 0}
+    for row in db.execute(
+        "SELECT status, COUNT(*) AS cnt FROM uploads WHERE user_id = ? GROUP BY status",
+        (g.user["id"],)
+    ):
+        uploads_counts[row["status"]] = row["cnt"]
+    uploads_rows = db.execute(
+        "SELECT original_name, target_folder, status, notes, created_at, reviewed_at "
+        "FROM uploads WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+        (g.user["id"],)
+    ).fetchall()
+    uploads = [dict(row) for row in uploads_rows]
+    stats = {
+        "views": views,
+        "minutes": f"{minutes:.1f}",
+        "avg": f"{avg:.2f}",
+        "favorites": favorites,
+        "last_view": stats_row["last_view_at"] if stats_row else None
+    }
+    return render_template_string(
+        TEMPLATE_ACCOUNT_STATS,
+        lang=lang, ui=ui, stats=stats, uploads_counts=uploads_counts,
+        uploads=uploads, current_user=g.user
+    )
+
+
+@app.route("/admin/panel")
+@login_required
+@admin_required
+def admin_panel():
+    lang, ui = get_lang()
+    refresh_video_index()
+    db = get_db()
+    total_users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    pending_count = db.execute("SELECT COUNT(*) FROM uploads WHERE status='pending'").fetchone()[0]
+    summary = {"videos": len(VIDEO_INDEX), "users": total_users, "pending": pending_count}
+
+    stats_rows = db.execute(
+        "SELECT user_id, views_count, seconds_watched, last_view_at FROM user_stats"
+    ).fetchall()
+    stats_map = {row["user_id"]: row for row in stats_rows}
+    fav_rows = db.execute(
+        "SELECT user_id, COUNT(*) AS cnt FROM favorites GROUP BY user_id"
+    ).fetchall()
+    fav_map = {row["user_id"]: row["cnt"] for row in fav_rows}
+    user_rows = db.execute(
+        "SELECT id, username, is_admin, is_moderator FROM users ORDER BY lower(username)"
+    ).fetchall()
+    users = []
+    for row in user_rows:
+        stat = stats_map.get(row["id"])
+        views = stat["views_count"] if stat else 0
+        seconds = stat["seconds_watched"] if stat else 0.0
+        minutes = seconds / 60.0
+        avg = (minutes / views) if views else 0.0
+        users.append({
+            "id": row["id"],
+            "username": row["username"],
+            "is_admin": bool(row["is_admin"]),
+            "is_moderator": bool(row["is_moderator"]),
+            "views": views,
+            "minutes": f"{minutes:.1f}",
+            "favorites": fav_map.get(row["id"], 0),
+            "last_view": stat["last_view_at"] if stat else None
+        })
+
+    pending_rows = db.execute(
+        "SELECT uploads.id, uploads.original_name, uploads.target_folder, uploads.created_at, uploads.size_bytes, "
+        "users.username FROM uploads JOIN users ON users.id = uploads.user_id "
+        "WHERE uploads.status='pending' ORDER BY uploads.created_at ASC"
+    ).fetchall()
+    pending_uploads = []
+    for row in pending_rows:
+        size_mb = (row["size_bytes"] or 0) / (1024 * 1024)
+        pending_uploads.append({
+            "id": row["id"],
+            "original_name": row["original_name"],
+            "target_folder": row["target_folder"] or "community",
+            "created_at": row["created_at"],
+            "size_mb": size_mb,
+            "username": row["username"]
+        })
+
+    return render_template_string(
+        TEMPLATE_ADMIN_PANEL,
+        lang=lang, ui=ui, summary=summary, users=users,
+        pending_uploads=pending_uploads, current_user=g.user
+    )
+
+
+@app.route("/moderator/panel")
+@login_required
+@moderator_required
+def moderator_panel():
+    lang, ui = get_lang()
+    db = get_db()
+    pending_rows = db.execute(
+        "SELECT uploads.id, uploads.original_name, uploads.target_folder, uploads.created_at, uploads.size_bytes, "
+        "users.username FROM uploads JOIN users ON users.id = uploads.user_id "
+        "WHERE uploads.status='pending' ORDER BY uploads.created_at ASC"
+    ).fetchall()
+    pending_uploads = []
+    for row in pending_rows:
+        pending_uploads.append({
+            "id": row["id"],
+            "original_name": row["original_name"],
+            "target_folder": row["target_folder"] or "community",
+            "created_at": row["created_at"],
+            "size_mb": (row["size_bytes"] or 0) / (1024 * 1024),
+            "username": row["username"]
+        })
+    recent_rows = db.execute(
+        "SELECT original_name, status, notes, created_at, reviewed_at FROM uploads "
+        "WHERE moderator_id = ? ORDER BY COALESCE(reviewed_at, created_at) DESC LIMIT 30",
+        (g.user["id"],)
+    ).fetchall()
+    recent_reviews = [dict(row) for row in recent_rows]
+    return render_template_string(
+        TEMPLATE_MOD_PANEL,
+        lang=lang, ui=ui, pending_uploads=pending_uploads,
+        recent_reviews=recent_reviews, current_user=g.user
+    )
+
+
+@app.route("/admin/moderators/<int:user_id>", methods=["POST"])
+@login_required
+@admin_required
+def toggle_moderator(user_id: int):
+    action = request.form.get("action")
+    next_url = request.form.get("next") or url_for("admin_panel")
+    if user_id == g.user["id"]:
+        return redirect(next_url)
+    db = get_db()
+    if action == "promote":
+        db.execute("UPDATE users SET is_moderator = 1 WHERE id = ?", (user_id,))
+    elif action == "demote":
+        db.execute("UPDATE users SET is_moderator = 0 WHERE id = ?", (user_id,))
+    db.commit()
+    return redirect(next_url)
+
+
+@app.route("/moderation/uploads/<int:upload_id>/file")
+@login_required
+@moderator_required
+def download_pending_upload(upload_id: int):
+    db = get_db()
+    row = db.execute(
+        "SELECT stored_name, original_name FROM uploads WHERE id = ?",
+        (upload_id,)
+    ).fetchone()
+    if row is None:
+        abort(404)
+    path = os.path.join(UPLOAD_ROOT, row["stored_name"])
+    if not os.path.exists(path):
+        abort(404)
+    return send_file(path, as_attachment=True, download_name=row["original_name"])
+
+
+def _finalize_destination(target_folder: str, original_name: str) -> Tuple[str, str]:
+    clean_folder = sanitize_folder_name(target_folder)
+    dest_dir = safe_join(VIDEO_ROOT, clean_folder)
+    os.makedirs(dest_dir, exist_ok=True)
+    base_name = sanitize_filename(original_name)
+    base, ext = os.path.splitext(base_name)
+    ext = ext or ".mp4"
+    candidate = base_name
+    dest_path = os.path.join(dest_dir, candidate)
+    counter = 1
+    while os.path.exists(dest_path):
+        candidate = f"{base}_{counter}{ext}"
+        dest_path = os.path.join(dest_dir, candidate)
+        counter += 1
+    rel_path = normalize_rel_path(os.path.relpath(dest_path, VIDEO_ROOT))
+    return dest_path, rel_path
+
+
+@app.route("/moderation/uploads/<int:upload_id>/approve", methods=["POST"])
+@login_required
+@moderator_required
+def approve_upload(upload_id: int):
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM uploads WHERE id = ? AND status = 'pending'",
+        (upload_id,)
+    ).fetchone()
+    if row is None:
+        abort(404)
+    target_folder = request.form.get("target_folder", row["target_folder"] or "community")
+    notes = (request.form.get("notes") or "").strip()
+    source_path = os.path.join(UPLOAD_ROOT, row["stored_name"])
+    if not os.path.exists(source_path):
+        abort(404)
+    dest_path, rel_path = _finalize_destination(target_folder, row["original_name"])
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    os.replace(source_path, dest_path)
+    size_bytes = os.path.getsize(dest_path)
+    duration_seconds = ffprobe_duration(dest_path)
+    generate_thumbnail(dest_path)
+    refresh_video_index(force=True)
+    db.execute(
+        "UPDATE uploads SET status='approved', moderator_id=?, notes=?, target_folder=?, final_path=?, "
+        "duration_seconds=?, size_bytes=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+        (g.user["id"], notes, sanitize_folder_name(target_folder), rel_path, duration_seconds, size_bytes, upload_id)
+    )
+    db.commit()
+    next_url = request.form.get("next") or url_for("moderator_panel")
+    return redirect(next_url)
+
+
+@app.route("/moderation/uploads/<int:upload_id>/reject", methods=["POST"])
+@login_required
+@moderator_required
+def reject_upload(upload_id: int):
+    db = get_db()
+    row = db.execute(
+        "SELECT stored_name FROM uploads WHERE id = ?",
+        (upload_id,)
+    ).fetchone()
+    if row is None:
+        abort(404)
+    notes = (request.form.get("notes") or "").strip()
+    source_path = os.path.join(UPLOAD_ROOT, row["stored_name"])
+    if os.path.exists(source_path):
+        try:
+            os.remove(source_path)
+        except Exception:
+            pass
+    db.execute(
+        "UPDATE uploads SET status='rejected', moderator_id=?, notes=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+        (g.user["id"], notes, upload_id)
+    )
+    db.commit()
+    next_url = request.form.get("next") or url_for("moderator_panel")
+    return redirect(next_url)
+
 @app.route("/random")
 def random_video():
     lang, _ = get_lang()
     selected_dirs = get_random_dirs_from_cookie()
-    all_videos = []
-
-    for root, dirs, files in os.walk(VIDEO_ROOT):
-        rel_dir = os.path.relpath(root, VIDEO_ROOT).replace("\\","/")
-        if selected_dirs:
-            top = rel_dir.split("/")[0] if rel_dir != "." else ""
-            if top and top not in selected_dirs:
-                continue
-        for f in files:
-            if f.lower().endswith(".mp4"):
-                rel = os.path.relpath(os.path.join(root, f), VIDEO_ROOT).replace("\\", "/")
-                if "/__previews__" in rel:
-                    continue
-                all_videos.append(rel)
-
-    if not all_videos:
+    refresh_video_index()
+    candidates: List[str] = []
+    for rel, meta in VIDEO_INDEX.items():
+        top = rel.split("/")[0] if rel and "/" in rel else rel
+        if selected_dirs and top and top not in selected_dirs:
+            continue
+        scope = get_protected_root_for(rel)
+        if scope and not (is_admin_request(request) or user_has_persistent_access(scope)):
+            continue
+        candidates.append(rel)
+    if not candidates:
         return redirect(url_for("browse", subpath=""))
-
-    video_path = random.choice(all_videos)
-
-    for prot in _protected:
-        if video_path.startswith(prot) and not (is_admin_request(request) or user_has_persistent_access(prot)):
-            return redirect(url_for("access_folder", subpath=prot))
-
+    video_path = random.choice(candidates)
     return redirect(url_for("watch_video", filepath=video_path))
 
 
