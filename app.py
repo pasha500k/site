@@ -328,36 +328,91 @@ try:
 except Exception:
     translator = None
 
-def translate_title_if_needed(name: str, lang: str) -> str:
-    # translate english -> ru only for filenames (not folders)
-    if lang != "ru":
-        return name
-    if any('А' <= ch <= 'я' for ch in name):
-        return name
-    if name in _trans_cache:
-        return _trans_cache[name]
-    out = name
-    if translator:
-        base, ext = os.path.splitext(name)
-        for _ in range(3):  # up to 3 attempts
-            try:
-                tr = translator.translate(base, src='en', dest='ru')
-                if asyncio.iscoroutine(tr):
-                    try:
-                        tr = asyncio.get_event_loop().run_until_complete(tr)
-                    except RuntimeError:
-                        loop = asyncio.new_event_loop()
-                        tr = loop.run_until_complete(tr)
-                        loop.close()
-                text = (getattr(tr, "text", None) or base).strip()
-                if text:
-                    out = text + ext
-                    break
-            except Exception:
-                continue
-    _trans_cache[name] = out
+
+def contains_cyrillic(text: str) -> bool:
+    return any('А' <= ch <= 'я' or ch in 'Ёё' for ch in text)
+
+
+def contains_latin(text: str) -> bool:
+    return any('A' <= ch <= 'Z' or 'a' <= ch <= 'z' for ch in text)
+
+
+def split_name_ext(name: str) -> Tuple[str, str]:
+    base, ext = os.path.splitext(name)
+    return base, ext
+
+
+def should_translate_title(name: str, lang: str) -> bool:
+    if lang not in {"ru", "en"}:
+        return False
+    base, _ = split_name_ext(name)
+    if not base.strip():
+        return False
+    if lang == "ru":
+        return contains_latin(base) and not contains_cyrillic(base)
+    if lang == "en":
+        return contains_cyrillic(base) and not contains_latin(base)
+    return False
+
+
+def cached_translation(name: str, lang: str) -> Optional[str]:
+    entry = _trans_cache.get(name)
+    if isinstance(entry, dict):
+        return entry.get(lang)
+    if isinstance(entry, str) and lang == "ru":
+        return entry
+    return None
+
+
+def cache_translation(name: str, lang: str, translated: str) -> None:
+    entry = _trans_cache.get(name)
+    if isinstance(entry, dict):
+        entry[lang] = translated
+    elif isinstance(entry, str):
+        if lang == "ru":
+            _trans_cache[name] = translated
+        else:
+            _trans_cache[name] = {"ru": entry, lang: translated}
+    else:
+        if lang == "ru":
+            _trans_cache[name] = translated
+        else:
+            _trans_cache[name] = {lang: translated}
     save_trans_cache()
-    return out
+
+
+def perform_translation(text: str, dest_lang: str) -> Optional[str]:
+    if not translator:
+        return None
+    for _ in range(3):
+        try:
+            result = translator.translate(text, dest=dest_lang)
+            if asyncio.iscoroutine(result):
+                try:
+                    result = asyncio.get_event_loop().run_until_complete(result)
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    result = loop.run_until_complete(result)
+                    loop.close()
+            translated = (getattr(result, "text", None) or "").strip()
+            if translated:
+                return translated
+        except Exception:
+            continue
+    return None
+
+
+def translate_title_if_needed(name: str, lang: str) -> str:
+    cached = cached_translation(name, lang)
+    if cached:
+        return cached
+    if not should_translate_title(name, lang):
+        return name
+    base, ext = split_name_ext(name)
+    translated_base = perform_translation(base, lang) or base
+    translated = f"{translated_base}{ext}"
+    cache_translation(name, lang, translated)
+    return translated
 
 # -------------------------
 # ACCESS TOKEN HELPERS (no cookies, HMAC query)
@@ -482,12 +537,24 @@ def format_duration(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def thumbnail_timestamp(video_path: str) -> float:
+    duration = ffprobe_duration(video_path)
+    if duration <= 0:
+        return 1.0
+    midpoint = duration / 2.0
+    return max(0.0, midpoint)
+
+
 def generate_thumbnail(video_path: str) -> str:
     thumb_path = os.path.splitext(video_path)[0] + ".jpg"
     if not os.path.exists(thumb_path):
+        ts = thumbnail_timestamp(video_path)
         try:
             subprocess.run(
-                ["ffmpeg","-y","-ss","2","-i",video_path,"-frames:v","1","-q:v","2",thumb_path],
+                [
+                    "ffmpeg","-y","-ss",f"{ts:.3f}","-i",video_path,
+                    "-frames:v","1","-q:v","2",thumb_path
+                ],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
         except Exception:
@@ -566,8 +633,31 @@ def list_subfolders(dir_abs: str) -> List[Dict]:
     return res
 
 
+def is_allowed_video_file(name: str) -> bool:
+    return os.path.splitext(name)[1].lower() in ALLOWED_EXT
+
+
+def build_video_entry(full_path: str, lang: str) -> Optional[Dict]:
+    if not os.path.isfile(full_path):
+        return None
+    name = os.path.basename(full_path)
+    if not is_allowed_video_file(name):
+        return None
+    rel = os.path.relpath(full_path, VIDEO_ROOT).replace("\\", "/")
+    display_name = translate_title_if_needed(name, lang)
+    duration = format_duration(ffprobe_duration(full_path))
+    thumb = os.path.relpath(generate_thumbnail(full_path), VIDEO_ROOT).replace("\\", "/")
+    return {
+        "name": name,
+        "display": display_name,
+        "path": rel,
+        "thumb": thumb,
+        "duration": duration
+    }
+
+
 def list_videos_in_dir(dir_abs: str, lang: str) -> List[Dict]:
-    res = []
+    res: List[Dict] = []
     if not os.path.isdir(dir_abs):
         return res
     for name in os.listdir(dir_abs):
@@ -576,35 +666,29 @@ def list_videos_in_dir(dir_abs: str, lang: str) -> List[Dict]:
         full = os.path.join(dir_abs, name)
         if os.path.isdir(full):
             continue
-        if os.path.splitext(name)[1].lower() in ALLOWED_EXT:
-            rel = os.path.relpath(full, VIDEO_ROOT).replace("\\","/")
-            disp = translate_title_if_needed(name, lang)
-            dur  = ffprobe_duration(full)
-            res.append({
-                "name": name, "display": disp, "path": rel,
-                "thumb": os.path.relpath(generate_thumbnail(full), VIDEO_ROOT).replace("\\","/"),
-                "duration": format_duration(dur)
-            })
+        entry = build_video_entry(full, lang)
+        if entry:
+            res.append(entry)
     res.sort(key=lambda x: x["display"].lower())
     return res
 
 
+def iter_video_files(root_dir: str):
+    for dirpath, dirs, files in os.walk(root_dir):
+        rel_dir = os.path.relpath(dirpath, root_dir)
+        if "__previews__" in rel_dir.split(os.sep):
+            continue
+        for filename in files:
+            if is_allowed_video_file(filename):
+                yield os.path.join(dirpath, filename)
+
+
 def list_all_videos(lang: str) -> List[Dict]:
-    res = []
-    for dirpath, dirs, files in os.walk(VIDEO_ROOT):
-        rel_dir = os.path.relpath(dirpath, VIDEO_ROOT)
-        if "__previews__" in rel_dir.split(os.sep): continue
-        for f in files:
-            if os.path.splitext(f)[1].lower() in ALLOWED_EXT:
-                full = os.path.join(dirpath, f)
-                rel  = os.path.relpath(full, VIDEO_ROOT).replace("\\","/")
-                disp = translate_title_if_needed(f, lang)
-                dur  = ffprobe_duration(full)
-                res.append({
-                    "name": f, "display": disp, "path": rel,
-                    "thumb": os.path.relpath(generate_thumbnail(full), VIDEO_ROOT).replace("\\","/"),
-                    "duration": format_duration(dur)
-                })
+    res: List[Dict] = []
+    for full_path in iter_video_files(VIDEO_ROOT):
+        entry = build_video_entry(full_path, lang)
+        if entry:
+            res.append(entry)
     return res
 
 
