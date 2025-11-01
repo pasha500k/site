@@ -12,6 +12,7 @@ import time
 import hashlib
 import hmac
 import sqlite3
+from collections import deque
 from functools import wraps
 from typing import List, Dict, Tuple, Optional
 
@@ -75,6 +76,9 @@ _dur_cache: Dict[str, float]  = load_json(DUR_CACHE_PATH, {})
 _views: Dict[str, int]        = load_json(VIEWS_PATH, {})
 _protected = load_json(PROTECTED_PATH, {})
 
+# in-memory buckets for lightweight rate limiting / bot protection
+_rate_buckets: Dict[str, deque] = {}
+
 
 def save_trans_cache(): save_json(TRANSL_CACHE_PATH, _trans_cache)
 
@@ -117,6 +121,21 @@ def init_db():
                 PRIMARY KEY(user_id, video_path),
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS view_events (
+                fingerprint TEXT NOT NULL,
+                video_path TEXT NOT NULL,
+                user_id INTEGER,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(fingerprint, video_path),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS folder_access (
+                user_id INTEGER NOT NULL,
+                folder_path TEXT NOT NULL,
+                granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, folder_path),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
             """
         )
         conn.commit()
@@ -135,6 +154,7 @@ def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DATABASE_PATH)
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
 
 
@@ -143,6 +163,99 @@ def close_db(exception):
     db = g.pop("db", None)
     if db is not None:
         db.close()
+
+
+def _rate_key(prefix: str) -> str:
+    ident = request.remote_addr or "unknown"
+    user = getattr(g, "user", None)
+    if user is not None:
+        ident = f"user:{user['id']}"
+    return f"{prefix}:{ident}"
+
+
+def allow_rate(prefix: str, limit: int, window_sec: int) -> bool:
+    key = _rate_key(prefix)
+    bucket = _rate_buckets.setdefault(key, deque())
+    now = time.time()
+    while bucket and now - bucket[0] > window_sec:
+        bucket.popleft()
+    if len(bucket) >= limit:
+        return False
+    bucket.append(now)
+    # prevent unbounded growth in long-running processes
+    while len(bucket) > limit:
+        bucket.popleft()
+    return True
+
+
+def viewer_identity(resp=None) -> Tuple[str, Optional[int]]:
+    user = getattr(g, "user", None)
+    if user is not None:
+        return f"user:{user['id']}", user["id"]
+    uid = get_user_cookie(resp)
+    return f"anon:{uid}", None
+
+
+def register_view_if_new(video_path: str, resp=None) -> bool:
+    fingerprint, user_id = viewer_identity(resp)
+    db = get_db()
+    row = db.execute(
+        "SELECT 1 FROM view_events WHERE fingerprint = ? AND video_path = ?",
+        (fingerprint, video_path)
+    ).fetchone()
+    if row:
+        return False
+    db.execute(
+        "INSERT INTO view_events (fingerprint, video_path, user_id) VALUES (?, ?, ?)",
+        (fingerprint, video_path, user_id)
+    )
+    db.commit()
+    return True
+
+
+def user_has_persistent_access(scope_path: Optional[str]) -> bool:
+    user = getattr(g, "user", None)
+    if not scope_path or user is None:
+        return False
+    normalized = scope_path.strip("/")
+    if not normalized:
+        return False
+    parts = normalized.split("/")
+    db = get_db()
+    for i in range(len(parts), 0, -1):
+        candidate = "/".join(parts[:i])
+        row = db.execute(
+            "SELECT 1 FROM folder_access WHERE user_id = ? AND folder_path = ?",
+            (user["id"], candidate)
+        ).fetchone()
+        if row:
+            return True
+    return False
+
+
+def remember_folder_access(folder_path: str) -> None:
+    user = getattr(g, "user", None)
+    if user is None:
+        return
+    normalized = folder_path.strip("/")
+    if not normalized:
+        return
+    db = get_db()
+    db.execute(
+        "INSERT INTO folder_access (user_id, folder_path) VALUES (?, ?) "
+        "ON CONFLICT(user_id, folder_path) DO NOTHING",
+        (user["id"], normalized)
+    )
+    db.commit()
+
+
+def clear_folder_access(folder_path: str) -> None:
+    normalized = folder_path.strip("/")
+    if not normalized:
+        return
+    db = get_db()
+    db.execute("DELETE FROM folder_access WHERE folder_path = ?", (normalized,))
+    db.commit()
 
 
 @app.before_request
@@ -187,7 +300,7 @@ UI_TEXT = {
         "saved_ok": "Saved", "fixed_ok": "Checked / fixed", "like": "Like", "dislike": "Dislike",
         "locked": "Locked", "enter_pass": "Enter password", "open": "Open", "wrong_pass": "Wrong password",
         "quality": "Quality", "original": "Original", "login": "Login", "logout": "Logout",
-        "register": "Register", "account": "Account"
+        "register": "Register", "account": "Account", "too_many_attempts": "Too many attempts, try later"
     },
     "ru": {
         "root": "Корень", "categories": "Категории", "videos": "Видео",
@@ -201,7 +314,7 @@ UI_TEXT = {
         "saved_ok": "Сохранено", "fixed_ok": "Проверено/исправлено", "like": "Лайк", "dislike": "Дизлайк",
         "locked": "Закрыта", "enter_pass": "Введите пароль", "open": "Открыть", "wrong_pass": "Неверный пароль",
         "quality": "Качество", "original": "Оригинал", "login": "Войти", "logout": "Выйти",
-        "register": "Регистрация", "account": "Аккаунт"
+        "register": "Регистрация", "account": "Аккаунт", "too_many_attempts": "Слишком много попыток, попробуйте позже"
     }
 }
 
@@ -282,6 +395,8 @@ def get_protected_root_for(rel_path: str) -> Optional[str]:
 
 def with_grant(url: str, scope: Optional[str]) -> str:
     if not scope:
+        return url
+    if is_admin_request() or user_has_persistent_access(scope):
         return url
     exp = int(time.time()) + ACCESS_TOKEN_TTL_SEC
     sig = mk_access_signature(scope, exp)
@@ -992,12 +1107,14 @@ video {
   const dislikeBtn=document.getElementById('dislike');
   const favBtn=document.getElementById('fav');
   const favLabel=document.getElementById('favLabel');
-  const loginRedirect='{{ url_for('login', next=request_path) }}';
-  const registerRedirect='{{ url_for('register', next=request_path) }}';
+  const loginRedirect={{ url_for('login', next=request_path)|tojson }};
+  const registerRedirect={{ url_for('register', next=request_path)|tojson }};
+  const stateUrl={{ url_for('api_state')|tojson }};
+  const videoPath={{ filepath|tojson }};
 
   async function refreshState(){
     try{
-      const res=await fetch('{{ url_for('api_state') }}?path={{ filepath|tojson|safe }}');
+      const res=await fetch(`${stateUrl}?path=${encodeURIComponent(videoPath)}`);
       if(!res.ok) return;
       const data=await res.json();
       document.getElementById('likes').textContent=data.likes;
@@ -1033,7 +1150,7 @@ video {
     const res=await fetch(url,{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({path: '{{ filepath }}'})
+      body:JSON.stringify({path: videoPath})
     });
     if(res.status===401){
       window.location=loginRedirect;
@@ -1071,7 +1188,9 @@ video {
     const url=isFav?'{{ url_for('api_unfavorite') }}':'{{ url_for('api_favorite') }}';
     const data=await postJSON(url);
     if(data){
-      favLabel.textContent=data.favorite?'❤️ ★':'❤️';
+      if(typeof data.favorite!=='undefined'){
+        favLabel.textContent=data.favorite?'❤️ ★':'❤️';
+      }
       refreshState();
     }
   });
@@ -1317,7 +1436,7 @@ def get_random_dirs_from_cookie() -> List[str]:
 
 def require_access_for(rel_path: str) -> Optional[Response]:
     scope = get_protected_root_for(rel_path)
-    if scope is None or is_admin_request(request):
+    if scope is None or is_admin_request(request) or user_has_persistent_access(scope):
         return None
     exp = request.args.get("exp")
     sig = request.args.get("sig")
@@ -1335,11 +1454,11 @@ def browse(subpath):
     dir_abs = safe_join(VIDEO_ROOT, subpath)
     if not os.path.exists(dir_abs) or not os.path.isdir(dir_abs): abort(404)
 
-    if subpath in _protected and not is_admin:
+    if subpath in _protected and not is_admin and not user_has_persistent_access(subpath):
         if request.method == "POST":
             pw = request.form.get("password", "")
             if hashlib.sha256(pw.encode()).hexdigest() == _protected.get(subpath):
-                pass
+                remember_folder_access(subpath)
             else:
                 return render_template_string(TEMPLATE_ACCESS, error=ui["wrong_pass"], path=subpath, lang=lang, ui=ui)
         else:
@@ -1365,9 +1484,12 @@ def access_folder(subpath):
     lang, ui = get_lang()
     if subpath not in _protected:
         return redirect(url_for("browse", subpath=subpath))
+    if is_admin_request(request) or user_has_persistent_access(subpath):
+        return redirect(url_for("browse", subpath=subpath))
     if request.method == "POST":
         pw = request.form.get("password", "")
         if hashlib.sha256(pw.encode()).hexdigest() == _protected.get(subpath):
+            remember_folder_access(subpath)
             dir_abs = safe_join(VIDEO_ROOT, subpath)
             if not os.path.isdir(dir_abs): abort(404)
             subfolders = list_subfolders(dir_abs)
@@ -1394,13 +1516,16 @@ def watch_video(filepath):
     if not os.path.isfile(full): abort(404)
 
     scope = get_protected_root_for(filepath)
-    if scope and not is_admin:
+    if scope and not (is_admin or user_has_persistent_access(scope)):
         exp = request.args.get("exp"); sig = request.args.get("sig")
         if not (exp and sig and verify_access_signature(scope, exp, sig)):
             return redirect(url_for("access_folder", subpath=scope))
 
-    _views[filepath] = _views.get(filepath, 0) + 1
-    save_views()
+    resp = make_response()
+
+    if register_view_if_new(filepath, resp):
+        _views[filepath] = _views.get(filepath, 0) + 1
+        save_views()
 
     current_dir_abs   = os.path.dirname(full)
     current_dir_rel   = os.path.relpath(current_dir_abs, VIDEO_ROOT).replace("\\","/")
@@ -1418,7 +1543,6 @@ def watch_video(filepath):
     counts = reaction_counts([filepath]).get(filepath, {"likes": 0, "dislikes": 0})
     likes, dislikes = counts.get("likes", 0), counts.get("dislikes", 0)
 
-    resp = make_response()
     get_user_cookie(resp)
 
     fav = is_favorite(filepath)
@@ -1668,6 +1792,8 @@ def api_state():
 def api_like():
     need = require_auth_api()
     if need: return need
+    if not allow_rate("react", 30, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
     data = request.get_json(force=True) or {}
     path = data.get("path")
     if not path:
@@ -1694,6 +1820,8 @@ def api_like():
 def api_dislike():
     need = require_auth_api()
     if need: return need
+    if not allow_rate("react", 30, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
     data = request.get_json(force=True) or {}
     path = data.get("path")
     if not path:
@@ -1720,6 +1848,8 @@ def api_dislike():
 def api_favorite():
     need = require_auth_api()
     if need: return need
+    if not allow_rate("favorite", 20, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
     data = request.get_json(force=True) or {}
     path = data.get("path")
     if not path:
@@ -1738,6 +1868,8 @@ def api_favorite():
 def api_unfavorite():
     need = require_auth_api()
     if need: return need
+    if not allow_rate("favorite", 20, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
     data = request.get_json(force=True) or {}
     path = data.get("path")
     if not path:
@@ -1805,7 +1937,7 @@ def random_video():
     video_path = random.choice(all_videos)
 
     for prot in _protected:
-        if video_path.startswith(prot) and not is_admin_request(request):
+        if video_path.startswith(prot) and not (is_admin_request(request) or user_has_persistent_access(prot)):
             return redirect(url_for("access_folder", subpath=prot))
 
     return redirect(url_for("watch_video", filepath=video_path))
@@ -1819,16 +1951,19 @@ def login():
     error = None
     next_url = request.args.get("next") or request.form.get("next") or url_for("browse", subpath="")
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        db = get_db()
-        row = db.execute("SELECT id, username, password_hash, is_admin FROM users WHERE lower(username) = lower(?)", (username,)).fetchone()
-        if row and check_password_hash(row["password_hash"], password):
-            session.clear()
-            session["user_id"] = row["id"]
-            return redirect(next_url)
+        if not allow_rate("login", 5, 60):
+            error = ui["too_many_attempts"]
         else:
-            error = "Неверный логин или пароль" if lang == "ru" else "Invalid credentials"
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+            db = get_db()
+            row = db.execute("SELECT id, username, password_hash, is_admin FROM users WHERE lower(username) = lower(?)", (username,)).fetchone()
+            if row and check_password_hash(row["password_hash"], password):
+                session.clear()
+                session["user_id"] = row["id"]
+                return redirect(next_url)
+            else:
+                error = "Неверный логин или пароль" if lang == "ru" else "Invalid credentials"
     alt = ui["register"] + f"? <a href=\"{url_for('register', next=next_url)}\">{ui['register']}</a>"
     return render_template_string(
         TEMPLATE_AUTH,
@@ -1848,28 +1983,31 @@ def register():
     error = None
     next_url = request.args.get("next") or request.form.get("next") or url_for("browse", subpath="")
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        password_confirm = request.form.get("password_confirm", "")
-        if not username or not password:
-            error = "Заполните все поля" if lang == "ru" else "Fill all fields"
-        elif password != password_confirm:
-            error = "Пароли не совпадают" if lang == "ru" else "Passwords do not match"
+        if not allow_rate("register", 3, 300):
+            error = ui["too_many_attempts"]
         else:
-            db = get_db()
-            exists = db.execute("SELECT 1 FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
-            if exists:
-                error = "Логин уже используется" if lang == "ru" else "Username already taken"
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+            password_confirm = request.form.get("password_confirm", "")
+            if not username or not password:
+                error = "Заполните все поля" if lang == "ru" else "Fill all fields"
+            elif password != password_confirm:
+                error = "Пароли не совпадают" if lang == "ru" else "Passwords do not match"
             else:
-                db.execute(
-                    "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 0)",
-                    (username, generate_password_hash(password))
-                )
-                db.commit()
-                row = db.execute("SELECT id FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
-                session.clear()
-                session["user_id"] = row["id"]
-                return redirect(next_url)
+                db = get_db()
+                exists = db.execute("SELECT 1 FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
+                if exists:
+                    error = "Логин уже используется" if lang == "ru" else "Username already taken"
+                else:
+                    db.execute(
+                        "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 0)",
+                        (username, generate_password_hash(password))
+                    )
+                    db.commit()
+                    row = db.execute("SELECT id FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
+                    session.clear()
+                    session["user_id"] = row["id"]
+                    return redirect(next_url)
     alt = ui["login"] + f"? <a href=\"{url_for('login', next=next_url)}\">{ui['login']}</a>"
     return render_template_string(
         TEMPLATE_AUTH,
@@ -1909,9 +2047,11 @@ def admin_protect():
         if act == "add":
             pw = request.form.get("password", "")
             if pw:
+                clear_folder_access(fld)
                 _protected[fld] = hashlib.sha256(pw.encode()).hexdigest(); save_protected()
         elif act == "remove":
             _protected.pop(fld, None); save_protected()
+            clear_folder_access(fld)
         return redirect(url_for("admin_protect"))
 
     return render_template_string(TEMPLATE_PROTECT, folders=folders, protected=_protected)
@@ -1988,6 +2128,7 @@ def admin_delete(filepath):
             db = get_db()
             db.execute("DELETE FROM reactions WHERE video_path = ?", (filepath,))
             db.execute("DELETE FROM favorites WHERE video_path = ?", (filepath,))
+            db.execute("DELETE FROM view_events WHERE video_path = ?", (filepath,))
             db.commit()
         except Exception as e:
             print("Ошибка удаления:", e)
@@ -2001,6 +2142,7 @@ if __name__ == "__main__":
     print(f"📂 Видео-каталог: {VIDEO_ROOT}")
     print(f"📂 Превью-каталог: {PREVIEW_ROOT}")
     print(f"🗂 Кэш: translations.json, durations.json, views.json, protected_folders.json")
+    print(f"🗄️ SQLite: {DATABASE_PATH}")
     print(f"🔐 Admin username: {ADMIN_USERNAME}")
     print(f"🔏 Access token TTL: {ACCESS_TOKEN_TTL_SEC}s (HMAC in query)")
     print("▶️ Запуск на http://0.0.0.0:8000")
