@@ -44,6 +44,7 @@ ACCESS_TOKEN_TTL_SEC = 10 * 60  # 10 минут
 
 DATABASE_PATH = os.path.join(VIDEO_ROOT, "app.db")
 SQLITE_MAX_VARIABLES = 999
+SEARCH_RESULT_LIMIT = 250
 
 os.makedirs(PREVIEW_ROOT, exist_ok=True)
 os.makedirs(UPLOAD_ROOT, exist_ok=True)
@@ -82,6 +83,25 @@ _protected = load_json(PROTECTED_PATH, {})
 
 # in-memory buckets for lightweight rate limiting / bot protection
 _rate_buckets: Dict[str, deque] = {}
+
+# hot caches for aggregate stats to avoid hammering sqlite on large libraries
+REACTION_CACHE: Dict[str, Dict[str, int]] = {}
+FAVORITE_CACHE: Dict[str, int] = {}
+
+# author → video paths mapping built from the on-disk index
+AUTHOR_VIDEO_INDEX: Dict[str, List[str]] = {}
+
+# frequently accessed popular videos (by view count)
+POPULAR_CACHE: List[str] = []
+POPULAR_CACHE_DIRTY = True
+POPULAR_CACHE_LAST_BUILD = 0.0
+POPULAR_CACHE_TTL = 60.0
+POPULAR_CACHE_MAX = 600
+
+
+def mark_popular_dirty() -> None:
+    global POPULAR_CACHE_DIRTY
+    POPULAR_CACHE_DIRTY = True
 
 
 def save_trans_cache(): save_json(TRANSL_CACHE_PATH, _trans_cache)
@@ -866,12 +886,14 @@ def iter_video_files(root_dir: str):
 
 
 def refresh_video_index(force: bool = False) -> None:
-    global VIDEO_INDEX_LAST_SCAN
+    global VIDEO_INDEX_LAST_SCAN, AUTHOR_VIDEO_INDEX
     now = time.time()
     if not force and (now - VIDEO_INDEX_LAST_SCAN) < VIDEO_INDEX_MIN_INTERVAL:
         return
     VIDEO_INDEX_LAST_SCAN = now
     seen: set = set()
+    author_map: Dict[str, List[str]] = {}
+    modified = False
     for full_path in iter_video_files(VIDEO_ROOT):
         rel = normalize_rel_path(os.path.relpath(full_path, VIDEO_ROOT))
         seen.add(rel)
@@ -881,29 +903,79 @@ def refresh_video_index(force: bool = False) -> None:
             continue
         mtime = stat.st_mtime
         size = stat.st_size
-        entry = VIDEO_INDEX.get(rel)
-        if entry and entry.get("mtime") == mtime and entry.get("size") == size:
-            continue
-        duration_seconds = ffprobe_duration(full_path)
-        thumb = os.path.relpath(generate_thumbnail(full_path), VIDEO_ROOT).replace("\\", "/")
-        VIDEO_INDEX[rel] = {
-            "name": os.path.basename(full_path),
-            "path": rel,
-            "directory": normalize_rel_path(os.path.relpath(os.path.dirname(full_path), VIDEO_ROOT)),
-            "thumb": thumb,
-            "duration_seconds": duration_seconds,
-            "duration": format_duration(duration_seconds),
-            "author": extract_author(rel),
-            "mtime": mtime,
-            "size": size,
-        }
+        base = VIDEO_INDEX.get(rel)
+        needs_refresh = (
+            base is None
+            or base.get("mtime") != mtime
+            or base.get("size") != size
+        )
+        if needs_refresh:
+            duration_seconds = ffprobe_duration(full_path)
+            thumb = os.path.relpath(generate_thumbnail(full_path), VIDEO_ROOT).replace("\\", "/")
+            name = os.path.basename(full_path)
+            display_ru = translate_title_if_needed(name, "ru")
+            display_en = translate_title_if_needed(name, "en")
+            base = {
+                "name": name,
+                "path": rel,
+                "directory": normalize_rel_path(os.path.relpath(os.path.dirname(full_path), VIDEO_ROOT)),
+                "thumb": thumb,
+                "duration_seconds": duration_seconds,
+                "duration": format_duration(duration_seconds),
+                "author": extract_author(rel),
+                "mtime": mtime,
+                "size": size,
+                "display_ru": display_ru,
+                "display_en": display_en,
+                "search_key_ru": display_ru.lower(),
+                "search_key_en": display_en.lower(),
+            }
+            VIDEO_INDEX[rel] = base
+            modified = True
+        else:
+            if "display_ru" not in base:
+                display_ru = translate_title_if_needed(base["name"], "ru")
+                base["display_ru"] = display_ru
+                base["search_key_ru"] = display_ru.lower()
+            if "display_en" not in base:
+                display_en = translate_title_if_needed(base["name"], "en")
+                base["display_en"] = display_en
+                base["search_key_en"] = display_en.lower()
+            if "duration" not in base or "duration_seconds" not in base:
+                duration_seconds = ffprobe_duration(full_path)
+                base["duration_seconds"] = duration_seconds
+                base["duration"] = format_duration(duration_seconds)
+            if base.get("mtime") != mtime:
+                base["mtime"] = mtime
+            if base.get("size") != size:
+                base["size"] = size
+            if base.get("author") is None:
+                base["author"] = extract_author(rel)
+        author = base.get("author")
+        if author:
+            author_map.setdefault(author, []).append(rel)
     for rel in list(VIDEO_INDEX.keys()):
         if rel not in seen:
             VIDEO_INDEX.pop(rel, None)
+            modified = True
+    AUTHOR_VIDEO_INDEX = author_map
+    if modified:
+        mark_popular_dirty()
+
+
+def base_display_name(base: Dict, lang: str) -> str:
+    key = f"display_{lang}"
+    display = base.get(key)
+    if display:
+        return display
+    display = translate_title_if_needed(base["name"], lang)
+    base[key] = display
+    base[f"search_key_{lang}"] = display.lower()
+    return display
 
 
 def localized_video_entry(base: Dict, lang: str) -> Dict:
-    display_name = translate_title_if_needed(base["name"], lang)
+    display_name = base_display_name(base, lang)
     entry = {
         "name": base["name"],
         "display": display_name,
@@ -914,6 +986,41 @@ def localized_video_entry(base: Dict, lang: str) -> Dict:
         "duration_seconds": base.get("duration_seconds", 0.0),
     }
     return entry
+
+
+def ensure_popular_cache() -> None:
+    global POPULAR_CACHE_DIRTY, POPULAR_CACHE_LAST_BUILD, POPULAR_CACHE
+    now = time.time()
+    if not POPULAR_CACHE_DIRTY and (now - POPULAR_CACHE_LAST_BUILD) < POPULAR_CACHE_TTL:
+        return
+    refresh_video_index()
+    sorted_by_views = sorted(_views.items(), key=lambda item: item[1], reverse=True)
+    seen: set = set()
+    popular: List[str] = []
+    for path, _count in sorted_by_views:
+        if path in VIDEO_INDEX and path not in seen:
+            popular.append(path)
+            seen.add(path)
+        if len(popular) >= POPULAR_CACHE_MAX:
+            break
+    if len(popular) < POPULAR_CACHE_MAX:
+        for path in VIDEO_INDEX.keys():
+            if path in seen:
+                continue
+            popular.append(path)
+            seen.add(path)
+            if len(popular) >= POPULAR_CACHE_MAX:
+                break
+    POPULAR_CACHE = popular
+    POPULAR_CACHE_LAST_BUILD = time.time()
+    POPULAR_CACHE_DIRTY = False
+
+
+def get_popular_videos(limit: int = 100) -> List[str]:
+    ensure_popular_cache()
+    if limit <= 0:
+        return POPULAR_CACHE[:]
+    return POPULAR_CACHE[:limit]
 
 
 def build_video_entry(full_path: str, lang: str) -> Optional[Dict]:
@@ -953,6 +1060,45 @@ def attach_secure_urls(videos: List[Dict]):
         v["watch_url"] = with_grant(url_for('watch_video', filepath=v['path']), sc)
         v["thumb_url"] = with_grant(url_for('serve_file', filepath=v['thumb']), sc if sc else None)
         v["preview_url"] = with_grant(url_for('preview_file', filepath=v['path']), sc if sc else None)
+
+
+def collect_video_entries(paths: List[str], lang: str) -> List[Dict]:
+    refresh_video_index()
+    entries: List[Dict] = []
+    for path in paths:
+        base = VIDEO_INDEX.get(path)
+        if not base:
+            continue
+        entries.append(localized_video_entry(base, lang))
+    return entries
+
+
+def build_recommendation_pool(current_path: str, lang: str, current_author: Optional[str], current_dir_prefix: str, desired: int = 400) -> List[Dict]:
+    refresh_video_index()
+    candidate_paths: List[str] = []
+    seen: set = set()
+    if current_author:
+        for path in AUTHOR_VIDEO_INDEX.get(current_author, []):
+            if path == current_path or path in seen:
+                continue
+            candidate_paths.append(path)
+            seen.add(path)
+    for path in get_popular_videos(desired):
+        if path == current_path or path in seen:
+            continue
+        candidate_paths.append(path)
+        seen.add(path)
+    if len(candidate_paths) < desired:
+        for path in VIDEO_INDEX.keys():
+            if path == current_path or path in seen:
+                continue
+            if current_dir_prefix and path.startswith(current_dir_prefix):
+                continue
+            candidate_paths.append(path)
+            seen.add(path)
+            if len(candidate_paths) >= desired:
+                break
+    return collect_video_entries(candidate_paths, lang)
 
 
 def compute_recommendation_score(entry: Dict, current_author: Optional[str], current_dir_prefix: str) -> float:
@@ -1040,13 +1186,12 @@ def get_player_mode():
 # -------------------------
 # Helpers for reactions / favorites
 # -------------------------
-def reaction_counts(paths: List[str]) -> Dict[str, Dict[str, int]]:
-    res = {p: {"likes": 0, "dislikes": 0} for p in paths}
-    if not paths:
-        return res
-    unique_paths = list(dict.fromkeys(paths))
+def refresh_reaction_cache_for(paths: List[str]) -> None:
+    unique = [p for p in dict.fromkeys(paths) if p]
+    if not unique:
+        return
     db = get_db()
-    for chunk in chunked_list(unique_paths, SQLITE_MAX_VARIABLES):
+    for chunk in chunked_list(unique, SQLITE_MAX_VARIABLES):
         if not chunk:
             continue
         placeholders = ",".join(["?"] * len(chunk))
@@ -1061,21 +1206,21 @@ def reaction_counts(paths: List[str]) -> Dict[str, Dict[str, int]]:
             """,
             chunk
         ).fetchall()
+        defaults = {path: {"likes": 0, "dislikes": 0} for path in chunk}
+        REACTION_CACHE.update(defaults)
         for row in rows:
-            res[row["video_path"]] = {
+            REACTION_CACHE[row["video_path"]] = {
                 "likes": row["likes"] or 0,
-                "dislikes": row["dislikes"] or 0
+                "dislikes": row["dislikes"] or 0,
             }
-    return res
 
 
-def favorite_counts(paths: List[str]) -> Dict[str, int]:
-    res = {p: 0 for p in paths}
-    if not paths:
-        return res
-    unique_paths = list(dict.fromkeys(paths))
+def refresh_favorite_cache_for(paths: List[str]) -> None:
+    unique = [p for p in dict.fromkeys(paths) if p]
+    if not unique:
+        return
     db = get_db()
-    for chunk in chunked_list(unique_paths, SQLITE_MAX_VARIABLES):
+    for chunk in chunked_list(unique, SQLITE_MAX_VARIABLES):
         if not chunk:
             continue
         placeholders = ",".join(["?"] * len(chunk))
@@ -1088,8 +1233,35 @@ def favorite_counts(paths: List[str]) -> Dict[str, int]:
             """,
             chunk
         ).fetchall()
+        defaults = {path: 0 for path in chunk}
+        FAVORITE_CACHE.update(defaults)
         for row in rows:
-            res[row["video_path"]] = row["cnt"] or 0
+            FAVORITE_CACHE[row["video_path"]] = row["cnt"] or 0
+
+
+def reaction_counts(paths: List[str]) -> Dict[str, Dict[str, int]]:
+    res = {p: {"likes": 0, "dislikes": 0} for p in paths}
+    if not paths:
+        return res
+    unique_paths = list(dict.fromkeys(paths))
+    missing = [p for p in unique_paths if p not in REACTION_CACHE]
+    if missing:
+        refresh_reaction_cache_for(missing)
+    for p in paths:
+        res[p] = REACTION_CACHE.get(p, {"likes": 0, "dislikes": 0})
+    return res
+
+
+def favorite_counts(paths: List[str]) -> Dict[str, int]:
+    res = {p: 0 for p in paths}
+    if not paths:
+        return res
+    unique_paths = list(dict.fromkeys(paths))
+    missing = [p for p in unique_paths if p not in FAVORITE_CACHE]
+    if missing:
+        refresh_favorite_cache_for(missing)
+    for p in paths:
+        res[p] = FAVORITE_CACHE.get(p, 0)
     return res
 
 
@@ -2378,6 +2550,7 @@ def watch_video(filepath):
     if register_view_if_new(filepath, resp, video_duration_seconds):
         _views[filepath] = _views.get(filepath, 0) + 1
         save_views()
+        mark_popular_dirty()
 
     current_dir_abs   = os.path.dirname(full)
     current_dir_rel   = os.path.relpath(current_dir_abs, VIDEO_ROOT).replace("\\","/")
@@ -2390,14 +2563,15 @@ def watch_video(filepath):
     related_same = random.sample(same_dir, min(5, len(same_dir))) if same_dir else []
     attach_secure_urls(related_same)
 
-    all_vids = list_all_videos(lang)
-    enrich_cards_with_stats(all_vids, include_favorites=True)
-    global_pool = [v for v in all_vids if v["path"] != filepath and not (current_dir_prefix and v["path"].startswith(current_dir_prefix))]
-    related_global = random.sample(global_pool, min(5, len(global_pool))) if global_pool else []
+    candidate_pool = build_recommendation_pool(filepath, lang, current_author, current_dir_prefix, desired=400)
+    enrich_cards_with_stats(candidate_pool, include_favorites=True)
+    global_pool = [v for v in candidate_pool if not (current_dir_prefix and v["path"].startswith(current_dir_prefix))]
+    random.shuffle(global_pool)
+    related_global = global_pool[:min(5, len(global_pool))]
     attach_secure_urls(related_global)
 
     used_paths = {v["path"] for v in related_same} | {v["path"] for v in related_global}
-    recommended_candidates = recommend_videos(filepath, all_vids, current_author, current_dir_prefix, limit=8)
+    recommended_candidates = recommend_videos(filepath, candidate_pool, current_author, current_dir_prefix, limit=8)
     recommended: List[Dict] = []
     for entry in recommended_candidates:
         if entry["path"] in used_paths:
@@ -2612,14 +2786,18 @@ def api_search():
     q = (request.args.get("q") or "").strip().lower()
     results = []
     if q:
-        all_videos = list_all_videos(lang)
-        enrich_cards_with_stats(all_videos)
-        for v in all_videos:
-            if not is_admin_request(request) and get_protected_root_for(v["path"]) is not None:
+        refresh_video_index()
+        is_admin = is_admin_request(request)
+        matches: List[Dict] = []
+        for base in list(VIDEO_INDEX.values()):
+            if not is_admin and get_protected_root_for(base["path"]) is not None:
                 continue
-            hay = (v["display"] or v["name"]).lower()
-            if q in hay:
-                results.append(v)
+            search_key = base.get(f"search_key_{lang}") or base_display_name(base, lang).lower()
+            if q in search_key:
+                matches.append(localized_video_entry(base, lang))
+        matches.sort(key=lambda item: item["display"].lower())
+        results = matches[:SEARCH_RESULT_LIMIT]
+        enrich_cards_with_stats(results)
     return jsonify({"results": results})
 
 
@@ -2670,6 +2848,7 @@ def api_like():
             (g.user["id"], path, "like")
         )
     db.commit()
+    refresh_reaction_cache_for([path])
     counts = reaction_counts([path])[path]
     return jsonify({"ok": True, "likes": counts["likes"], "dislikes": counts["dislikes"], "user_reaction": user_reaction_for(path)})
 
@@ -2698,6 +2877,7 @@ def api_dislike():
             (g.user["id"], path, "dislike")
         )
     db.commit()
+    refresh_reaction_cache_for([path])
     counts = reaction_counts([path])[path]
     return jsonify({"ok": True, "likes": counts["likes"], "dislikes": counts["dislikes"], "user_reaction": user_reaction_for(path)})
 
@@ -2719,6 +2899,7 @@ def api_favorite():
         (g.user["id"], path)
     )
     db.commit()
+    refresh_favorite_cache_for([path])
     return jsonify({"ok": True, "favorite": True})
 
 
@@ -2738,6 +2919,7 @@ def api_unfavorite():
         (g.user["id"], path)
     )
     db.commit()
+    refresh_favorite_cache_for([path])
     return jsonify({"ok": True, "favorite": False})
 
 
@@ -3087,22 +3269,24 @@ def reject_upload(upload_id: int):
 
 @app.route("/random")
 def random_video():
-    lang, _ = get_lang()
-    selected_dirs = get_random_dirs_from_cookie()
     refresh_video_index()
+    selected_dirs = set(normalize_rel_path(x) for x in get_random_dirs_from_cookie() if x)
+    is_admin = is_admin_request(request)
     candidates: List[str] = []
-    for rel, meta in VIDEO_INDEX.items():
-        top = rel.split("/")[0] if rel and "/" in rel else rel
-        if selected_dirs and top and top not in selected_dirs:
+    for rel in VIDEO_INDEX.keys():
+        top = rel.split("/", 1)[0] if rel else rel
+        top_normalized = normalize_rel_path(top)
+        if selected_dirs and top_normalized not in selected_dirs:
             continue
         scope = get_protected_root_for(rel)
-        if scope and not (is_admin_request(request) or user_has_persistent_access(scope)):
+        if scope and not (is_admin or user_has_persistent_access(scope)):
             continue
         candidates.append(rel)
     if not candidates:
         return redirect(url_for("browse", subpath=""))
     video_path = random.choice(candidates)
-    return redirect(url_for("watch_video", filepath=video_path))
+    scope = get_protected_root_for(video_path)
+    return redirect(with_grant(url_for("watch_video", filepath=video_path), scope))
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -3287,6 +3471,9 @@ def admin_delete(filepath):
             prv_abs = os.path.join(PREVIEW_ROOT, prv_rel)
             if os.path.exists(prv_abs): os.remove(prv_abs)
             _views.pop(filepath, None); save_views()
+            mark_popular_dirty()
+            REACTION_CACHE.pop(filepath, None)
+            FAVORITE_CACHE.pop(filepath, None)
             db = get_db()
             db.execute("DELETE FROM reactions WHERE video_path = ?", (filepath,))
             db.execute("DELETE FROM favorites WHERE video_path = ?", (filepath,))
