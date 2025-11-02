@@ -3223,15 +3223,55 @@ def watch_video(filepath):
 def serve_file(filepath):
     rel = filepath.replace("\\","/")
     need = require_access_for(rel)
-    if need is not None: return need
+    if need is not None:
+        return need
 
     full = safe_join(VIDEO_ROOT, filepath)
-    if not os.path.exists(full): abort(404)
+    if not os.path.exists(full):
+        abort(404)
 
-    resp = send_file(full, mimetype="video/mp4", conditional=True)
+    file_size = os.path.getsize(full)
+    range_header = request.headers.get("Range")
+    byte1 = 0
+    byte2 = file_size - 1
+
+    if range_header:
+        m = re.search(r"bytes=(\d+)-(\d*)", range_header)
+        if m:
+            g1, g2 = m.groups()
+            byte1 = int(g1)
+            if g2:
+                byte2 = min(file_size - 1, int(g2))
+    byte1 = max(0, byte1)
+    byte2 = max(byte1, min(byte2, file_size - 1))
+    length = (byte2 - byte1) + 1
+
+    def file_stream(path: str, start: int, length: int, chunk: int = 64 * 1024):
+        f = open(path, "rb")
+        try:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                data = f.read(min(chunk, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+        finally:
+            f.close()
+
+    status = 206 if range_header else 200
+    if request.method == "HEAD":
+        response_iter: Iterable[bytes] = []
+    else:
+        response_iter = stream_with_context(file_stream(full, byte1, length))
+
+    resp = Response(response_iter, status=status, mimetype="video/mp4", direct_passthrough=True)
     resp.headers["Accept-Ranges"] = "bytes"
-    # Disable default caching so updated files are fetched freshly
+    resp.headers["Content-Length"] = str(length)
     resp.headers.setdefault("Cache-Control", "no-store")
+    if range_header:
+        resp.headers["Content-Range"] = f"bytes {byte1}-{byte2}/{file_size}"
     return resp
 
 
