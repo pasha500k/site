@@ -17,7 +17,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from functools import wraps
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple, Optional, Set, Iterable
 import uuid
 
 from flask import (
@@ -101,6 +101,10 @@ POPULAR_CACHE_LAST_BUILD = 0.0
 POPULAR_CACHE_TTL = 60.0
 POPULAR_CACHE_MAX = 600
 
+# cached co-watch transitions (direction, path) -> List[(path, weight)]
+TRANSITION_CACHE: Dict[Tuple[str, str], List[Tuple[str, float]]] = {}
+TRANSITION_CACHE_LOCK = threading.Lock()
+
 
 def mark_popular_dirty() -> None:
     global POPULAR_CACHE_DIRTY
@@ -162,6 +166,35 @@ def init_db():
                 author_override TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS watch_sessions (
+                session_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                user_id INTEGER,
+                video_path TEXT NOT NULL,
+                watched_seconds REAL NOT NULL DEFAULT 0,
+                duration_seconds REAL,
+                meaningful INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS watch_cursor (
+                fingerprint TEXT PRIMARY KEY,
+                last_video_path TEXT,
+                last_session_id TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS video_transitions (
+                from_path TEXT NOT NULL,
+                to_path TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 0,
+                last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(from_path, to_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_watch_sessions_user ON watch_sessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_watch_sessions_video ON watch_sessions(video_path);
+            CREATE INDEX IF NOT EXISTS idx_video_transitions_from ON video_transitions(from_path);
+            CREATE INDEX IF NOT EXISTS idx_video_transitions_to ON video_transitions(to_path);
             CREATE TABLE IF NOT EXISTS folder_access (
                 user_id INTEGER NOT NULL,
                 folder_path TEXT NOT NULL,
@@ -212,6 +245,11 @@ def init_db():
             conn.execute("ALTER TABLE uploads ADD COLUMN duration_seconds REAL")
         if not has_column("uploads", "size_bytes"):
             conn.execute("ALTER TABLE uploads ADD COLUMN size_bytes INTEGER")
+
+        if not has_column("watch_sessions", "meaningful"):
+            conn.execute("ALTER TABLE watch_sessions ADD COLUMN meaningful INTEGER NOT NULL DEFAULT 0")
+        if not has_column("watch_sessions", "duration_seconds"):
+            conn.execute("ALTER TABLE watch_sessions ADD COLUMN duration_seconds REAL")
 
         cur = conn.execute("SELECT id FROM users WHERE is_admin=1 LIMIT 1")
         if cur.fetchone() is None:
@@ -270,24 +308,30 @@ def viewer_identity(resp=None) -> Tuple[str, Optional[int]]:
     return f"anon:{uid}", None
 
 
-def _upsert_user_stats(db: sqlite3.Connection, user_id: int, duration_seconds: float) -> None:
+def _update_user_stats(
+    db: sqlite3.Connection,
+    user_id: Optional[int],
+    seconds_delta: float = 0.0,
+    increment_view: bool = False,
+) -> None:
     if user_id is None:
         return
-    seconds = max(float(duration_seconds or 0), 0.0)
+    seconds = max(float(seconds_delta or 0.0), 0.0)
+    view_inc = 1 if increment_view else 0
     db.execute(
         """
         INSERT INTO user_stats (user_id, views_count, seconds_watched, last_view_at)
-        VALUES (?, 1, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(user_id) DO UPDATE SET
-            views_count = views_count + 1,
-            seconds_watched = seconds_watched + excluded.seconds_watched,
+            views_count = user_stats.views_count + ?,
+            seconds_watched = user_stats.seconds_watched + ?,
             last_view_at = CURRENT_TIMESTAMP
         """,
-        (user_id, seconds)
+        (user_id, view_inc, seconds, view_inc, seconds)
     )
 
 
-def register_view_if_new(video_path: str, resp=None, duration_seconds: Optional[float] = None) -> bool:
+def register_view_if_new(video_path: str, resp=None) -> bool:
     fingerprint, user_id = viewer_identity(resp)
     db = get_db()
     row = db.execute(
@@ -300,8 +344,8 @@ def register_view_if_new(video_path: str, resp=None, duration_seconds: Optional[
         "INSERT INTO view_events (fingerprint, video_path, user_id) VALUES (?, ?, ?)",
         (fingerprint, video_path, user_id)
     )
-    if user_id is not None and duration_seconds is not None:
-        _upsert_user_stats(db, user_id, duration_seconds)
+    if user_id is not None:
+        _update_user_stats(db, user_id, seconds_delta=0.0, increment_view=True)
     db.commit()
     return True
 
@@ -340,6 +384,109 @@ def remember_folder_access(folder_path: str) -> None:
         (user["id"], normalized)
     )
     db.commit()
+
+
+def transition_cache_key(kind: str, path: str) -> Tuple[str, str]:
+    return (kind, normalize_rel_path(path))
+
+
+def invalidate_transition_cache_for(paths: Iterable[str]) -> None:
+    normalized = {normalize_rel_path(p) for p in paths if p}
+    if not normalized:
+        return
+    with TRANSITION_CACHE_LOCK:
+        keys_to_remove = [key for key in TRANSITION_CACHE.keys() if key[1] in normalized]
+        for key in keys_to_remove:
+            TRANSITION_CACHE.pop(key, None)
+
+
+def fetch_transition_list(kind: str, path: str, limit: int = 200) -> List[Tuple[str, float]]:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return []
+    key = transition_cache_key(kind, normalized)
+    with TRANSITION_CACHE_LOCK:
+        cached = TRANSITION_CACHE.get(key)
+    if cached is not None:
+        return cached[:limit]
+    db = get_db()
+    if kind == "out":
+        rows = db.execute(
+            "SELECT to_path AS neighbor, weight FROM video_transitions WHERE from_path = ? "
+            "ORDER BY weight DESC, last_update DESC LIMIT ?",
+            (normalized, limit),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT from_path AS neighbor, weight FROM video_transitions WHERE to_path = ? "
+            "ORDER BY weight DESC, last_update DESC LIMIT ?",
+            (normalized, limit),
+        ).fetchall()
+    results: List[Tuple[str, float]] = []
+    for row in rows:
+        neighbor = normalize_rel_path(row["neighbor"])
+        if not neighbor or neighbor == normalized:
+            continue
+        results.append((neighbor, float(row["weight"] or 0.0)))
+    with TRANSITION_CACHE_LOCK:
+        TRANSITION_CACHE[key] = results
+    return results[:limit]
+
+
+def get_sequence_neighbors(path: str, limit: int = 400) -> Dict[str, float]:
+    neighbors: Dict[str, float] = {}
+    for neighbor, weight in fetch_transition_list("out", path, limit):
+        neighbors[neighbor] = neighbors.get(neighbor, 0.0) + weight
+    for neighbor, weight in fetch_transition_list("in", path, limit):
+        neighbors[neighbor] = neighbors.get(neighbor, 0.0) + weight * 0.7
+    return neighbors
+
+
+def record_transition(fingerprint: str, session_id: str, video_path: str) -> None:
+    normalized = normalize_rel_path(video_path)
+    if not normalized:
+        return
+    db = get_db()
+    row = db.execute(
+        "SELECT last_video_path FROM watch_cursor WHERE fingerprint = ?",
+        (fingerprint,),
+    ).fetchone()
+    previous = normalize_rel_path(row["last_video_path"]) if row and row["last_video_path"] else None
+    if previous and previous != normalized:
+        db.execute(
+            """
+            INSERT INTO video_transitions (from_path, to_path, weight, last_update)
+            VALUES (?, ?, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT(from_path, to_path) DO UPDATE SET
+                weight = video_transitions.weight + 1,
+                last_update = CURRENT_TIMESTAMP
+            """,
+            (previous, normalized),
+        )
+        invalidate_transition_cache_for([previous, normalized])
+    db.execute(
+        """
+        INSERT INTO watch_cursor (fingerprint, last_video_path, last_session_id, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(fingerprint) DO UPDATE SET
+            last_video_path = excluded.last_video_path,
+            last_session_id = excluded.last_session_id,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (fingerprint, normalized, session_id),
+    )
+
+
+def is_meaningful_watch(watched_seconds: float, duration_seconds: float) -> bool:
+    watched = max(watched_seconds, 0.0)
+    duration = max(duration_seconds, 0.0)
+    if duration <= 0:
+        return watched >= 90.0
+    ratio = watched / duration if duration else 0.0
+    threshold = max(min(duration * 0.45, 600.0), 60.0)
+    if duration < 180.0:
+        threshold = max(duration * 0.6, 45.0)
+    return watched >= threshold or ratio >= 0.85 or watched >= 240.0
 
 
 def clear_folder_access(folder_path: str) -> None:
@@ -1179,10 +1326,12 @@ def refresh_video_index(force: bool = False) -> None:
             author = base.get("author")
             if author:
                 author_map.setdefault(author, []).append(rel)
+        removed_paths: List[str] = []
         for rel in list(VIDEO_INDEX.keys()):
             if rel not in seen:
                 VIDEO_INDEX.pop(rel, None)
                 removed_overrides.append(rel)
+                removed_paths.append(rel)
                 modified = True
         AUTHOR_VIDEO_INDEX = author_map
         if modified:
@@ -1190,6 +1339,36 @@ def refresh_video_index(force: bool = False) -> None:
             mark_popular_dirty()
         if removed_overrides:
             remove_author_overrides(removed_overrides)
+        if removed_paths:
+            invalidate_transition_cache_for(removed_paths)
+            if removed_paths:
+                close_conn = False
+                if has_app_context():
+                    db = get_db()
+                else:
+                    db = sqlite3.connect(DATABASE_PATH)
+                    close_conn = True
+                try:
+                    for chunk in chunked_list(removed_paths, SQLITE_MAX_VARIABLES):
+                        if not chunk:
+                            continue
+                        placeholders = ",".join(["?"] * len(chunk))
+                        db.execute(
+                            f"DELETE FROM video_transitions WHERE from_path IN ({placeholders}) OR to_path IN ({placeholders})",
+                            tuple(chunk + chunk),
+                        )
+                        db.execute(
+                            f"DELETE FROM watch_sessions WHERE video_path IN ({placeholders})",
+                            tuple(chunk),
+                        )
+                        db.execute(
+                            f"UPDATE watch_cursor SET last_video_path = NULL WHERE last_video_path IN ({placeholders})",
+                            tuple(chunk),
+                        )
+                    db.commit()
+                finally:
+                    if close_conn:
+                        db.close()
 
 
 def base_display_name(base: Dict, lang: str) -> str:
@@ -1307,6 +1486,12 @@ def build_recommendation_pool(current_path: str, lang: str, current_author: Opti
     refresh_video_index()
     candidate_paths: List[str] = []
     seen: set = set()
+    sequence_scores = get_sequence_neighbors(current_path, limit=desired * 2)
+    for path, weight in sequence_scores.items():
+        if path == current_path or path in seen:
+            continue
+        candidate_paths.append(path)
+        seen.add(path)
     if current_author:
         for path in AUTHOR_VIDEO_INDEX.get(current_author, []):
             if path == current_path or path in seen:
@@ -1328,7 +1513,10 @@ def build_recommendation_pool(current_path: str, lang: str, current_author: Opti
             seen.add(path)
             if len(candidate_paths) >= desired:
                 break
-    return collect_video_entries(candidate_paths, lang)
+    entries = collect_video_entries(candidate_paths, lang)
+    for entry in entries:
+        entry["_sequence_weight"] = sequence_scores.get(entry["path"], 0.0)
+    return entries
 
 
 def compute_recommendation_score(
@@ -1344,6 +1532,9 @@ def compute_recommendation_score(
     score += entry.get("likes", 0) * 3.0
     score -= entry.get("dislikes", 0) * 1.5
     score += entry.get("favorites", 0) * 5.0
+    seq_weight = float(entry.get("_sequence_weight") or 0.0)
+    if seq_weight:
+        score += seq_weight * 8.0
     author = entry.get("author")
     if current_author and author == current_author:
         score += 40.0
@@ -2048,6 +2239,40 @@ video {
   const registerRedirect={{ url_for('register', next=request_path)|tojson }};
   const stateUrl={{ url_for('api_state')|tojson }};
   const videoPath={{ filepath|tojson }};
+  const progressUrl={{ url_for('api_watch_progress')|tojson }};
+  const watchSession={{ watch_session_id|tojson }};
+  const durationSeconds={{ video_duration_seconds|tojson }};
+  const videoEl=document.querySelector('video');
+  let lastTime=0;
+  let accumulated=0;
+  let playing=false;
+
+  function captureProgress(){
+    if(!videoEl) return;
+    const current=videoEl.currentTime||0;
+    if(playing){
+      const delta=current-lastTime;
+      if(delta>0){
+        accumulated+=delta;
+      }
+    }
+    lastTime=current;
+  }
+
+  async function sendProgress(useBeacon){
+    if(accumulated<=0.4) return;
+    const payload=JSON.stringify({path:videoPath,session:watchSession,seconds:accumulated,duration:durationSeconds});
+    accumulated=0;
+    if(useBeacon && navigator.sendBeacon){
+      try{
+        navigator.sendBeacon(progressUrl,new Blob([payload],{type:'application/json'}));
+      }catch(e){}
+      return;
+    }
+    try{
+      await fetch(progressUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:payload,keepalive:true});
+    }catch(e){}
+  }
 
   async function refreshState(){
     try{
@@ -2131,6 +2356,57 @@ video {
       refreshState();
     }
   });
+
+  if(videoEl){
+    videoEl.addEventListener('play',()=>{
+      lastTime=videoEl.currentTime||0;
+      playing=true;
+    });
+    videoEl.addEventListener('pause',()=>{
+      captureProgress();
+      playing=false;
+      sendProgress(false).catch(()=>{});
+    });
+    videoEl.addEventListener('timeupdate',()=>{
+      if(!playing) { lastTime=videoEl.currentTime||0; return; }
+      const current=videoEl.currentTime||0;
+      const delta=current-lastTime;
+      if(delta>0){
+        accumulated+=delta;
+      }
+      lastTime=current;
+      if(accumulated>=10){
+        sendProgress(false).catch(()=>{});
+      }
+    });
+    videoEl.addEventListener('seeked',()=>{
+      lastTime=videoEl.currentTime||0;
+    });
+    videoEl.addEventListener('ended',()=>{
+      captureProgress();
+      playing=false;
+      sendProgress(false).catch(()=>{});
+    });
+    setInterval(()=>{
+      if(!videoEl) return;
+      captureProgress();
+      sendProgress(false).catch(()=>{});
+    },15000);
+    document.addEventListener('visibilitychange',()=>{
+      if(document.visibilityState==='hidden'){
+        captureProgress();
+        playing=false;
+        sendProgress(true).catch(()=>{});
+      }
+    });
+    const flush=()=>{
+      captureProgress();
+      playing=false;
+      sendProgress(true).catch(()=>{});
+    };
+    window.addEventListener('beforeunload',flush);
+    window.addEventListener('pagehide',flush);
+  }
 
   refreshState();
 })();
@@ -2863,7 +3139,7 @@ def watch_video(filepath):
 
     video_duration_seconds = ffprobe_duration(full)
 
-    if register_view_if_new(filepath, resp, video_duration_seconds):
+    if register_view_if_new(filepath, resp):
         _views[filepath] = _views.get(filepath, 0) + 1
         save_views()
         mark_popular_dirty()
@@ -2922,6 +3198,8 @@ def watch_video(filepath):
     download_original_name = f"{base_name}.mp4"
     download_height_names = {h: f"{base_name}_{h}p.mp4" for h in heights}
 
+    watch_session_id = uuid.uuid4().hex
+
     html = render_template_string(
         TEMPLATE_VIDEO,
         video_name=video_name_disp, filepath=filepath, back_url=back_url, random_url=random_url,
@@ -2934,7 +3212,8 @@ def watch_video(filepath):
         duration=duration_disp, file_url=file_url, stream_base=stream_base,
         thumb_url=with_grant(url_for('serve_file', filepath=os.path.relpath(generate_thumbnail(full), VIDEO_ROOT).replace("\\","/")), scope if scope else None),
         current_user=g.user, request_path=request.full_path if request.query_string else request.path,
-        author=current_author
+        author=current_author, watch_session_id=watch_session_id,
+        video_duration_seconds=video_duration_seconds
     )
     resp.set_data(html)
     return resp
@@ -3211,6 +3490,64 @@ def api_unfavorite():
     db.commit()
     refresh_favorite_cache_for([path])
     return jsonify({"ok": True, "favorite": False})
+
+
+@app.route("/api/watch-progress", methods=["POST"])
+def api_watch_progress():
+    data = request.get_json(silent=True) or {}
+    path = data.get("path")
+    session_id = data.get("session")
+    seconds_val = data.get("seconds")
+    duration_hint = data.get("duration")
+    if not path or not session_id:
+        return jsonify({"ok": False, "error": "bad_request"}), 400
+    try:
+        seconds = float(seconds_val)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds <= 0:
+        return jsonify({"ok": True})
+    seconds = max(0.0, min(seconds, 7200.0))
+    fingerprint, user_id = viewer_identity()
+    get_user_cookie()
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return jsonify({"ok": False, "error": "bad_path"}), 400
+    refresh_video_index()
+    base = VIDEO_INDEX.get(normalized)
+    duration_seconds: float = 0.0
+    if base and base.get("duration_seconds") is not None:
+        duration_seconds = float(base.get("duration_seconds"))
+    else:
+        try:
+            duration_seconds = float(duration_hint or 0.0)
+        except (TypeError, ValueError):
+            duration_seconds = 0.0
+    db = get_db()
+    db.execute(
+        """
+        INSERT INTO watch_sessions (session_id, fingerprint, user_id, video_path, watched_seconds, duration_seconds, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(session_id) DO UPDATE SET
+            watched_seconds = watch_sessions.watched_seconds + ?,
+            duration_seconds = COALESCE(excluded.duration_seconds, watch_sessions.duration_seconds),
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (session_id, fingerprint, user_id, normalized, seconds, duration_seconds or None, seconds, duration_seconds or None),
+    )
+    row = db.execute(
+        "SELECT watched_seconds, duration_seconds, meaningful FROM watch_sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    total_seconds = row["watched_seconds"] if row else seconds
+    stored_duration = row["duration_seconds"] if row and row["duration_seconds"] is not None else duration_seconds
+    if user_id is not None:
+        _update_user_stats(db, user_id, seconds_delta=seconds, increment_view=False)
+    if row and not row["meaningful"] and is_meaningful_watch(total_seconds, stored_duration or 0.0):
+        db.execute("UPDATE watch_sessions SET meaningful = 1 WHERE session_id = ?", (session_id,))
+        record_transition(fingerprint, session_id, normalized)
+    db.commit()
+    return jsonify({"ok": True})
 
 
 @app.route("/favorites")
@@ -3774,8 +4111,12 @@ def admin_delete(filepath):
             db.execute("DELETE FROM reactions WHERE video_path = ?", (filepath,))
             db.execute("DELETE FROM favorites WHERE video_path = ?", (filepath,))
             db.execute("DELETE FROM view_events WHERE video_path = ?", (filepath,))
+            db.execute("DELETE FROM watch_sessions WHERE video_path = ?", (filepath,))
+            db.execute("DELETE FROM video_transitions WHERE from_path = ? OR to_path = ?", (filepath, filepath))
+            db.execute("UPDATE watch_cursor SET last_video_path = NULL WHERE last_video_path = ?", (filepath,))
             remove_author_overrides([filepath], db=db, autocommit=False)
             db.commit()
+            invalidate_transition_cache_for([filepath])
         except Exception as e:
             print("Ошибка удаления:", e)
     return redirect(url_for("browse", subpath=os.path.dirname(filepath)))
