@@ -27,6 +27,7 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.http import parse_range_header, http_date
+from werkzeug.wsgi import wrap_file
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("APP_SECRET_KEY", "change-me")
@@ -3251,7 +3252,6 @@ def serve_file(filepath):
                 start = 0
                 end = file_size - 1
             else:
-                # suffix length
                 if end <= 0:
                     resp = Response(status=416)
                     resp.headers["Accept-Ranges"] = "bytes"
@@ -3286,19 +3286,19 @@ def serve_file(filepath):
             resp = Response(status=206)
             resp.headers["Content-Length"] = str(length)
         else:
-            def generate_range() -> Iterable[bytes]:
-                with open(full, "rb") as fh:
-                    fh.seek(start)
-                    remaining = length
-                    chunk_size = 1024 * 1024
-                    while remaining > 0:
-                        chunk = fh.read(min(chunk_size, remaining))
-                        if not chunk:
-                            break
-                        remaining -= len(chunk)
-                        yield chunk
+            file_handle = open(full, "rb")
+            file_handle.seek(start)
+            wrapped = wrap_file(request.environ, file_handle)
 
-            resp = Response(stream_with_context(generate_range()), status=206, mimetype="video/mp4")
+            def cleanup() -> None:
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
+
+            resp = Response(wrapped, status=206, mimetype="video/mp4", direct_passthrough=True)
+            resp.call_on_close(cleanup)
+            resp.content_length = length
 
         resp.headers["Accept-Ranges"] = "bytes"
         resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
@@ -3320,7 +3320,7 @@ def serve_file(filepath):
         full,
         mimetype="video/mp4",
         as_attachment=False,
-        conditional=False,
+        conditional=True,
         download_name=os.path.basename(full)
     )
 
