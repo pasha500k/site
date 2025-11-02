@@ -3232,24 +3232,38 @@ def serve_file(filepath):
 
     file_size = os.path.getsize(full)
     range_header = request.headers.get("Range")
-    byte1 = 0
-    byte2 = file_size - 1
+    start = 0
+    end = file_size - 1
+    range_handled = False
 
     if range_header:
         m = re.search(r"bytes=(\d+)-(\d*)", range_header)
         if m:
             g1, g2 = m.groups()
-            byte1 = int(g1)
+            try:
+                start = int(g1)
+            except (TypeError, ValueError):
+                start = 0
+            if start >= file_size:
+                resp = Response(status=416)
+                resp.headers["Accept-Ranges"] = "bytes"
+                resp.headers["Content-Range"] = f"bytes */{file_size}"
+                resp.headers["Content-Length"] = "0"
+                return resp
             if g2:
-                byte2 = min(file_size - 1, int(g2))
-    byte1 = max(0, byte1)
-    byte2 = max(byte1, min(byte2, file_size - 1))
-    length = (byte2 - byte1) + 1
+                try:
+                    end = int(g2)
+                except (TypeError, ValueError):
+                    end = file_size - 1
+            end = min(end, file_size - 1)
+            if end < start:
+                end = start
+            range_handled = True
+    length = (end - start) + 1
 
-    def file_stream(path: str, start: int, length: int, chunk: int = 64 * 1024):
-        f = open(path, "rb")
-        try:
-            f.seek(start)
+    def file_stream(path: str, start_pos: int, length: int, chunk: int = 64 * 1024):
+        with open(path, "rb") as f:
+            f.seek(start_pos)
             remaining = length
             while remaining > 0:
                 data = f.read(min(chunk, remaining))
@@ -3257,21 +3271,19 @@ def serve_file(filepath):
                     break
                 remaining -= len(data)
                 yield data
-        finally:
-            f.close()
 
-    status = 206 if range_header else 200
+    status = 206 if range_handled else 200
     if request.method == "HEAD":
         response_iter: Iterable[bytes] = []
     else:
-        response_iter = stream_with_context(file_stream(full, byte1, length))
+        response_iter = stream_with_context(file_stream(full, start, length))
 
     resp = Response(response_iter, status=status, mimetype="video/mp4", direct_passthrough=True)
     resp.headers["Accept-Ranges"] = "bytes"
     resp.headers["Content-Length"] = str(length)
     resp.headers.setdefault("Cache-Control", "no-store")
-    if range_header:
-        resp.headers["Content-Range"] = f"bytes {byte1}-{byte2}/{file_size}"
+    if range_handled:
+        resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
     return resp
 
 
