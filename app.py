@@ -26,7 +26,7 @@ from flask import (
     session, g, has_app_context
 )
 from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.http import parse_range_header
+from werkzeug.http import parse_range_header, http_date
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("APP_SECRET_KEY", "change-me")
@@ -3232,37 +3232,101 @@ def serve_file(filepath):
         abort(404)
 
     file_size = os.path.getsize(full)
-    range_header = request.headers.get("Range")
+    last_modified = http_date(os.path.getmtime(full))
 
+    range_header = request.headers.get("Range")
     if range_header:
         parsed = parse_range_header(range_header, file_size)
-        # Reject malformed or unsatisfiable ranges early to avoid hitting Werkzeug's defaults
         if parsed is None or not parsed.ranges:
             resp = Response(status=416)
             resp.headers["Accept-Ranges"] = "bytes"
             resp.headers["Content-Range"] = f"bytes */{file_size}"
             resp.headers["Content-Length"] = "0"
+            resp.headers["Last-Modified"] = last_modified
             return resp
-        start, _ = parsed.ranges[0]
-        if start is not None and start >= file_size:
+
+        start, end = parsed.ranges[0]
+        if start is None:
+            if end is None:
+                start = 0
+                end = file_size - 1
+            else:
+                # suffix length
+                if end <= 0:
+                    resp = Response(status=416)
+                    resp.headers["Accept-Ranges"] = "bytes"
+                    resp.headers["Content-Range"] = f"bytes */{file_size}"
+                    resp.headers["Content-Length"] = "0"
+                    resp.headers["Last-Modified"] = last_modified
+                    return resp
+                length = min(end, file_size)
+                start = file_size - length
+                end = file_size - 1
+        else:
+            if start >= file_size:
+                resp = Response(status=416)
+                resp.headers["Accept-Ranges"] = "bytes"
+                resp.headers["Content-Range"] = f"bytes */{file_size}"
+                resp.headers["Content-Length"] = "0"
+                resp.headers["Last-Modified"] = last_modified
+                return resp
+            if end is None or end >= file_size:
+                end = file_size - 1
+
+        length = end - start + 1
+        if length <= 0:
             resp = Response(status=416)
             resp.headers["Accept-Ranges"] = "bytes"
             resp.headers["Content-Range"] = f"bytes */{file_size}"
             resp.headers["Content-Length"] = "0"
+            resp.headers["Last-Modified"] = last_modified
             return resp
+
+        if request.method == "HEAD":
+            resp = Response(status=206)
+            resp.headers["Content-Length"] = str(length)
+        else:
+            def generate_range() -> Iterable[bytes]:
+                with open(full, "rb") as fh:
+                    fh.seek(start)
+                    remaining = length
+                    chunk_size = 1024 * 1024
+                    while remaining > 0:
+                        chunk = fh.read(min(chunk_size, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        yield chunk
+
+            resp = Response(stream_with_context(generate_range()), status=206, mimetype="video/mp4")
+
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        resp.headers["Last-Modified"] = last_modified
+        resp.headers.setdefault("Content-Type", "video/mp4")
+        return resp
+
+    if request.method == "HEAD":
+        resp = Response(status=200)
+        resp.headers["Content-Length"] = str(file_size)
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        resp.headers["Last-Modified"] = last_modified
+        resp.headers["Content-Type"] = "video/mp4"
+        return resp
 
     resp = send_file(
         full,
         mimetype="video/mp4",
         as_attachment=False,
-        conditional=True,
-        max_age=0,
+        conditional=False,
         download_name=os.path.basename(full)
     )
 
-    # `conditional=True` already applies byte ranges; just normalise caching headers.
-    resp.headers.setdefault("Cache-Control", "no-store")
-    resp.headers.setdefault("Accept-Ranges", "bytes")
+    resp.headers["Accept-Ranges"] = "bytes"
+    resp.headers.setdefault("Cache-Control", "public, max-age=3600")
+    resp.headers.setdefault("Last-Modified", last_modified)
     return resp
 
 
