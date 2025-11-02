@@ -26,6 +26,7 @@ from flask import (
     session, g, has_app_context
 )
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.http import parse_range_header
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("APP_SECRET_KEY", "change-me")
@@ -3221,7 +3222,7 @@ def watch_video(filepath):
 
 @app.route("/files/<path:filepath>")
 def serve_file(filepath):
-    rel = filepath.replace("\\","/")
+    rel = filepath.replace("\\", "/")
     need = require_access_for(rel)
     if need is not None:
         return need
@@ -3232,58 +3233,36 @@ def serve_file(filepath):
 
     file_size = os.path.getsize(full)
     range_header = request.headers.get("Range")
-    start = 0
-    end = file_size - 1
-    range_handled = False
 
     if range_header:
-        m = re.search(r"bytes=(\d+)-(\d*)", range_header)
-        if m:
-            g1, g2 = m.groups()
-            try:
-                start = int(g1)
-            except (TypeError, ValueError):
-                start = 0
-            if start >= file_size:
-                resp = Response(status=416)
-                resp.headers["Accept-Ranges"] = "bytes"
-                resp.headers["Content-Range"] = f"bytes */{file_size}"
-                resp.headers["Content-Length"] = "0"
-                return resp
-            if g2:
-                try:
-                    end = int(g2)
-                except (TypeError, ValueError):
-                    end = file_size - 1
-            end = min(end, file_size - 1)
-            if end < start:
-                end = start
-            range_handled = True
-    length = (end - start) + 1
+        parsed = parse_range_header(range_header, file_size)
+        # Reject malformed or unsatisfiable ranges early to avoid hitting Werkzeug's defaults
+        if parsed is None or not parsed.ranges:
+            resp = Response(status=416)
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Content-Range"] = f"bytes */{file_size}"
+            resp.headers["Content-Length"] = "0"
+            return resp
+        start, _ = parsed.ranges[0]
+        if start is not None and start >= file_size:
+            resp = Response(status=416)
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Content-Range"] = f"bytes */{file_size}"
+            resp.headers["Content-Length"] = "0"
+            return resp
 
-    def file_stream(path: str, start_pos: int, length: int, chunk: int = 64 * 1024):
-        with open(path, "rb") as f:
-            f.seek(start_pos)
-            remaining = length
-            while remaining > 0:
-                data = f.read(min(chunk, remaining))
-                if not data:
-                    break
-                remaining -= len(data)
-                yield data
+    resp = send_file(
+        full,
+        mimetype="video/mp4",
+        as_attachment=False,
+        conditional=True,
+        max_age=0,
+        download_name=os.path.basename(full)
+    )
 
-    status = 206 if range_handled else 200
-    if request.method == "HEAD":
-        response_iter: Iterable[bytes] = []
-    else:
-        response_iter = stream_with_context(file_stream(full, start, length))
-
-    resp = Response(response_iter, status=status, mimetype="video/mp4", direct_passthrough=True)
-    resp.headers["Accept-Ranges"] = "bytes"
-    resp.headers["Content-Length"] = str(length)
+    # `conditional=True` already applies byte ranges; just normalise caching headers.
     resp.headers.setdefault("Cache-Control", "no-store")
-    if range_handled:
-        resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    resp.headers.setdefault("Accept-Ranges", "bytes")
     return resp
 
 
