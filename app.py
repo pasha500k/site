@@ -17,13 +17,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from functools import wraps
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 import uuid
 
 from flask import (
     Flask, render_template_string, request, url_for, abort,
     Response, send_file, redirect, jsonify, make_response, stream_with_context,
-    session, g
+    session, g, has_app_context
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -156,6 +156,11 @@ def init_db():
                 first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(fingerprint, video_path),
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS video_metadata (
+                video_path TEXT PRIMARY KEY,
+                author_override TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS folder_access (
                 user_id INTEGER NOT NULL,
@@ -344,6 +349,111 @@ def clear_folder_access(folder_path: str) -> None:
     db = get_db()
     db.execute("DELETE FROM folder_access WHERE folder_path = ?", (normalized,))
     db.commit()
+
+
+def fetch_author_overrides() -> Dict[str, str]:
+    query = (
+        "SELECT video_path, author_override FROM video_metadata "
+        "WHERE author_override IS NOT NULL AND author_override <> ''"
+    )
+    if has_app_context():
+        db = get_db()
+        rows = db.execute(query).fetchall()
+    else:
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(query).fetchall()
+        finally:
+            conn.close()
+    return {
+        normalize_rel_path(row["video_path"]): row["author_override"]
+        for row in rows
+        if row["author_override"]
+    }
+
+
+def remove_author_overrides(
+    paths: List[str],
+    db: Optional[sqlite3.Connection] = None,
+    autocommit: bool = True,
+) -> None:
+    normalized = [normalize_rel_path(p) for p in paths if p]
+    if not normalized:
+        return
+    close_conn = False
+    own_connection = False
+    if db is None:
+        if has_app_context():
+            db = get_db()
+        else:
+            db = sqlite3.connect(DATABASE_PATH)
+            close_conn = True
+            own_connection = True
+    try:
+        for chunk in chunked_list(normalized, SQLITE_MAX_VARIABLES):
+            if not chunk:
+                continue
+            placeholders = ",".join(["?"] * len(chunk))
+            db.execute(
+                f"DELETE FROM video_metadata WHERE video_path IN ({placeholders})",
+                chunk,
+            )
+        if close_conn or (autocommit and not own_connection):
+            db.commit()
+    finally:
+        if close_conn and db is not None:
+            db.close()
+
+
+def set_video_author_override(
+    path: str, author: Optional[str], db: Optional[sqlite3.Connection] = None
+) -> None:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return
+    close_conn = False
+    if db is None:
+        if has_app_context():
+            db = get_db()
+        else:
+            db = sqlite3.connect(DATABASE_PATH)
+            close_conn = True
+    try:
+        if author:
+            db.execute(
+                """
+                INSERT INTO video_metadata (video_path, author_override, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(video_path) DO UPDATE SET
+                    author_override=excluded.author_override,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (normalized, author),
+            )
+        else:
+            db.execute(
+                "DELETE FROM video_metadata WHERE video_path = ?",
+                (normalized,),
+            )
+        if close_conn:
+            db.commit()
+    finally:
+        if close_conn and db is not None:
+            db.close()
+
+
+def author_for_path(path: str) -> Optional[str]:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return None
+    refresh_video_index()
+    base = VIDEO_INDEX.get(normalized)
+    if base:
+        author = base.get("author")
+        if author:
+            return author
+    return extract_author(normalized)
 
 
 @app.before_request
@@ -715,7 +825,7 @@ def extract_author(rel_path: str) -> Optional[str]:
 
 def author_from_full_path(full_path: str) -> Optional[str]:
     rel = os.path.relpath(full_path, VIDEO_ROOT)
-    return extract_author(rel)
+    return author_for_path(rel)
 
 
 def get_user_cookie(resp=None) -> str:
@@ -880,17 +990,28 @@ def apply_video_index(data: Dict[str, Dict]) -> None:
     global VIDEO_INDEX, AUTHOR_VIDEO_INDEX
     new_index: Dict[str, Dict] = {}
     author_map: Dict[str, List[str]] = {}
+    author_overrides = fetch_author_overrides()
     for rel, payload in (data or {}).items():
         if not isinstance(payload, dict):
             continue
+        normalized_rel = normalize_rel_path(rel)
+        if not normalized_rel:
+            continue
         entry = payload.copy()
-        entry.setdefault("path", rel)
+        entry["path"] = normalized_rel
         if "duration" not in entry and entry.get("duration_seconds") is not None:
             entry["duration"] = format_duration(entry.get("duration_seconds", 0.0))
-        new_index[rel] = entry
+        override = author_overrides.get(normalized_rel)
+        if override:
+            entry["author"] = override
+        elif "author" in entry and entry["author"] is not None:
+            entry["author"] = entry["author"]
+        else:
+            entry["author"] = extract_author(normalized_rel)
+        new_index[normalized_rel] = entry
         author = entry.get("author")
         if author:
-            author_map.setdefault(author, []).append(rel)
+            author_map.setdefault(author, []).append(normalized_rel)
     VIDEO_INDEX = new_index
     AUTHOR_VIDEO_INDEX = author_map
     mark_popular_dirty()
@@ -978,6 +1099,8 @@ def refresh_video_index(force: bool = False) -> None:
         VIDEO_INDEX_LAST_SCAN = now
         seen: set = set()
         author_map: Dict[str, List[str]] = {}
+        author_overrides = fetch_author_overrides()
+        removed_overrides: List[str] = []
         modified = False
         for full_path in iter_video_files(VIDEO_ROOT):
             rel = normalize_rel_path(os.path.relpath(full_path, VIDEO_ROOT))
@@ -1000,6 +1123,7 @@ def refresh_video_index(force: bool = False) -> None:
                 name = os.path.basename(full_path)
                 display_ru = translate_title_if_needed(name, "ru")
                 display_en = translate_title_if_needed(name, "en")
+                author_value = author_overrides.get(rel) or extract_author(rel)
                 base = {
                     "name": name,
                     "path": rel,
@@ -1007,7 +1131,7 @@ def refresh_video_index(force: bool = False) -> None:
                     "thumb": thumb,
                     "duration_seconds": duration_seconds,
                     "duration": format_duration(duration_seconds),
-                    "author": extract_author(rel),
+                    "author": author_value,
                     "mtime": mtime,
                     "size": size,
                     "display_ru": display_ru,
@@ -1040,9 +1164,16 @@ def refresh_video_index(force: bool = False) -> None:
                 if base.get("size") != size:
                     base["size"] = size
                     base_modified = True
-                if base.get("author") is None:
-                    base["author"] = extract_author(rel)
-                    base_modified = True
+                override = author_overrides.get(rel)
+                if override:
+                    if base.get("author") != override:
+                        base["author"] = override
+                        base_modified = True
+                else:
+                    inferred = extract_author(rel)
+                    if base.get("author") != inferred:
+                        base["author"] = inferred
+                        base_modified = True
                 if base_modified:
                     modified = True
             author = base.get("author")
@@ -1051,11 +1182,14 @@ def refresh_video_index(force: bool = False) -> None:
         for rel in list(VIDEO_INDEX.keys()):
             if rel not in seen:
                 VIDEO_INDEX.pop(rel, None)
+                removed_overrides.append(rel)
                 modified = True
         AUTHOR_VIDEO_INDEX = author_map
         if modified:
             persist_video_index()
             mark_popular_dirty()
+        if removed_overrides:
+            remove_author_overrides(removed_overrides)
 
 
 def base_display_name(base: Dict, lang: str) -> str:
@@ -1079,6 +1213,7 @@ def localized_video_entry(base: Dict, lang: str) -> Dict:
         "duration": base["duration"],
         "author": base.get("author"),
         "duration_seconds": base.get("duration_seconds", 0.0),
+        "mtime": base.get("mtime", 0.0),
     }
     return entry
 
@@ -1196,27 +1331,59 @@ def build_recommendation_pool(current_path: str, lang: str, current_author: Opti
     return collect_video_entries(candidate_paths, lang)
 
 
-def compute_recommendation_score(entry: Dict, current_author: Optional[str], current_dir_prefix: str) -> float:
+def compute_recommendation_score(
+    entry: Dict,
+    current_author: Optional[str],
+    current_dir_prefix: str,
+    author_weights: Optional[Dict[str, float]] = None,
+    watched_paths: Optional[Set[str]] = None,
+    now_ts: Optional[float] = None,
+) -> float:
     score = 0.0
     score += entry.get("views", 0) * 0.1
     score += entry.get("likes", 0) * 3.0
     score -= entry.get("dislikes", 0) * 1.5
     score += entry.get("favorites", 0) * 5.0
-    if current_author and entry.get("author") == current_author:
+    author = entry.get("author")
+    if current_author and author == current_author:
         score += 40.0
     if current_dir_prefix and entry["path"].startswith(current_dir_prefix):
         score += 20.0
+    weights = author_weights or {}
+    if author and author in weights:
+        score += weights[author] * 7.0
+    watched = watched_paths or set()
+    if entry["path"] in watched:
+        score -= 60.0
+    mtime = entry.get("mtime", 0.0) or 0.0
+    reference = now_ts or time.time()
+    if mtime:
+        age_days = max((reference - mtime) / 86400.0, 0.0)
+        score += max(0.0, 25.0 - age_days)
     score += random.random()
     return score
 
 
 def recommend_videos(current_path: str, videos: List[Dict], current_author: Optional[str], current_dir_prefix: str, limit: int = 6) -> List[Dict]:
     scored: List[Tuple[float, Dict]] = []
+    author_weights = user_author_weights()
+    watched_paths = user_watched_paths()
+    reference_ts = time.time()
     for entry in videos:
         if entry["path"] == current_path:
             continue
         entry_copy = dict(entry)
-        scored.append((compute_recommendation_score(entry_copy, current_author, current_dir_prefix), entry_copy))
+        scored.append((
+            compute_recommendation_score(
+                entry_copy,
+                current_author,
+                current_dir_prefix,
+                author_weights,
+                watched_paths,
+                reference_ts,
+            ),
+            entry_copy,
+        ))
     scored.sort(key=lambda item: item[0], reverse=True)
     return [item[1] for item in scored[:limit]]
 
@@ -1358,6 +1525,60 @@ def favorite_counts(paths: List[str]) -> Dict[str, int]:
     for p in paths:
         res[p] = FAVORITE_CACHE.get(p, 0)
     return res
+
+
+def user_watched_paths() -> Set[str]:
+    user = getattr(g, "user", None)
+    if user is None:
+        return set()
+    cached = getattr(g, "_watched_paths", None)
+    if cached is not None:
+        return cached
+    db = get_db()
+    rows = db.execute(
+        "SELECT video_path FROM view_events WHERE user_id = ?",
+        (user["id"],),
+    ).fetchall()
+    watched = {normalize_rel_path(row["video_path"]) for row in rows if row["video_path"]}
+    g._watched_paths = watched
+    return watched
+
+
+def user_author_weights() -> Dict[str, float]:
+    user = getattr(g, "user", None)
+    if user is None:
+        return {}
+    cached = getattr(g, "_author_weights", None)
+    if cached is not None:
+        return cached
+    refresh_video_index()
+    weights: Dict[str, float] = {}
+    db = get_db()
+    rows = db.execute(
+        "SELECT video_path, reaction FROM reactions WHERE user_id = ?",
+        (user["id"],),
+    ).fetchall()
+    for row in rows:
+        normalized = normalize_rel_path(row["video_path"])
+        base = VIDEO_INDEX.get(normalized)
+        author = base.get("author") if base else extract_author(normalized)
+        if not author:
+            continue
+        delta = 2.0 if row["reaction"] == "like" else -1.0
+        weights[author] = weights.get(author, 0.0) + delta
+    fav_rows = db.execute(
+        "SELECT video_path FROM favorites WHERE user_id = ?",
+        (user["id"],),
+    ).fetchall()
+    for row in fav_rows:
+        normalized = normalize_rel_path(row["video_path"])
+        base = VIDEO_INDEX.get(normalized)
+        author = base.get("author") if base else extract_author(normalized)
+        if not author:
+            continue
+        weights[author] = weights.get(author, 0.0) + 3.0
+    g._author_weights = weights
+    return weights
 
 
 def user_reaction_for(path: str) -> Optional[str]:
@@ -2651,7 +2872,7 @@ def watch_video(filepath):
     current_dir_rel   = os.path.relpath(current_dir_abs, VIDEO_ROOT).replace("\\","/")
     current_dir_prefix= (current_dir_rel + "/") if current_dir_rel != "." else ""
 
-    current_author = extract_author(filepath)
+    current_author = author_for_path(filepath)
 
     same_dir = [v for v in list_videos_in_dir(current_dir_abs, lang) if v["path"] != filepath]
     enrich_cards_with_stats(same_dir, include_favorites=True)
@@ -3299,6 +3520,12 @@ def approve_upload(upload_id: int):
     size_bytes = os.path.getsize(dest_path)
     duration_seconds = ffprobe_duration(dest_path)
     generate_thumbnail(dest_path)
+    author_row = db.execute(
+        "SELECT username FROM users WHERE id = ?",
+        (row["user_id"],),
+    ).fetchone()
+    author_name = (author_row["username"].strip() if author_row and author_row["username"] else None)
+    set_video_author_override(rel_path, author_name, db=db)
     refresh_video_index(force=True)
     db.execute(
         "UPDATE uploads SET status='approved', moderator_id=?, notes=?, target_folder=?, final_path=?, "
@@ -3547,6 +3774,7 @@ def admin_delete(filepath):
             db.execute("DELETE FROM reactions WHERE video_path = ?", (filepath,))
             db.execute("DELETE FROM favorites WHERE video_path = ?", (filepath,))
             db.execute("DELETE FROM view_events WHERE video_path = ?", (filepath,))
+            remove_author_overrides([filepath], db=db, autocommit=False)
             db.commit()
         except Exception as e:
             print("Ошибка удаления:", e)
