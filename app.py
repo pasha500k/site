@@ -689,7 +689,9 @@ UI_TEXT = {
         "total_users": "Users", "favorites_count": "Favorites saved", "uploads_pending": "Pending",
         "uploads_approved": "Approved", "uploads_rejected": "Rejected", "upload_history": "Your uploads",
         "moderation_notes": "Moderation notes", "minutes_short": "minutes", "views_count": "Views",
-        "avg_minutes": "Average minutes", "last_view": "Last view"
+        "avg_minutes": "Average minutes", "last_view": "Last view",
+        "sort_by": "Sort by", "sort_name": "Alphabetical", "sort_popular": "Most viewed",
+        "sort_likes": "Most liked", "sort_duration": "Longest", "sort_date": "Newest"
     },
     "ru": {
         "root": "Корень", "categories": "Категории", "videos": "Видео",
@@ -723,9 +725,76 @@ UI_TEXT = {
         "uploads_pending": "На модерации", "uploads_approved": "Одобрено", "uploads_rejected": "Отклонено",
         "upload_history": "Ваши загрузки", "moderation_notes": "Комментарий модератора",
         "minutes_short": "минут", "views_count": "Просмотры", "avg_minutes": "Среднее (мин)",
-        "last_view": "Последний просмотр"
+        "last_view": "Последний просмотр",
+        "sort_by": "Сортировка", "sort_name": "По названию", "sort_popular": "По популярности",
+        "sort_likes": "По лайкам", "sort_duration": "По длительности", "sort_date": "По дате (новые)"
     }
 }
+
+SORT_MODES: Tuple[str, ...] = ("name", "popular", "likes", "duration", "date")
+SORT_LABEL_KEYS = {
+    "name": "sort_name",
+    "popular": "sort_popular",
+    "likes": "sort_likes",
+    "duration": "sort_duration",
+    "date": "sort_date",
+}
+
+
+def build_sort_options(ui: Dict[str, str]) -> List[Tuple[str, str]]:
+    return [(mode, ui.get(SORT_LABEL_KEYS[mode], mode.title())) for mode in SORT_MODES]
+
+
+def resolve_sort_mode() -> str:
+    sort_mode = request.args.get("sort")
+    if request.method == "POST":
+        sort_mode = request.form.get("sort") or sort_mode
+    if not sort_mode or sort_mode not in SORT_MODES:
+        return "name"
+    return sort_mode
+
+
+def apply_sort(videos: List[Dict], sort_mode: str) -> None:
+    if not videos:
+        return
+    mode = sort_mode if sort_mode in SORT_MODES else "name"
+    if mode == "popular":
+        videos.sort(
+            key=lambda v: (
+                v.get("views", 0),
+                v.get("likes", 0),
+                v.get("favorites", 0),
+                v.get("duration_seconds", 0.0),
+            ),
+            reverse=True,
+        )
+    elif mode == "likes":
+        videos.sort(
+            key=lambda v: (
+                v.get("likes", 0),
+                v.get("views", 0),
+                v.get("duration_seconds", 0.0),
+            ),
+            reverse=True,
+        )
+    elif mode == "duration":
+        videos.sort(
+            key=lambda v: (
+                v.get("duration_seconds", 0.0) or 0.0,
+                v.get("views", 0),
+            ),
+            reverse=True,
+        )
+    elif mode == "date":
+        videos.sort(
+            key=lambda v: (
+                v.get("mtime", 0.0) or 0.0,
+                v.get("views", 0),
+            ),
+            reverse=True,
+        )
+    else:
+        videos.sort(key=lambda v: (v.get("display", "").lower(), v.get("path", "")))
 
 # -------------------------
 # TRANSLATOR (googletrans) with retries
@@ -1831,13 +1900,15 @@ a{color:#58a6ff;text-decoration:none}
 </head>
 <body>
 <div class=\"card\">
+  {% set sort_arg = sort_mode if sort_mode != 'name' else None %}
   <h2>🔒 {{ path }}</h2>
   <form method=\"post\">
+    <input type=\"hidden\" name=\"sort\" value=\"{{ sort_mode }}\">
     <input type=\"password\" name=\"password\" placeholder=\"{{ ui['enter_pass'] }}\" required>
     <button type=\"submit\">{{ ui['open'] }}</button>
   </form>
   {% if error %}<div class=\"msg\">{{ error }}</div>{% endif %}
-  <div style=\"margin-top:10px\"><a href=\"{{ url_for('browse', subpath='') }}\">← {{ ui['back'] }}</a></div>
+  <div style=\"margin-top:10px\"><a href=\"{{ url_for('browse', subpath='', sort=sort_arg) }}\">← {{ ui['back'] }}</a></div>
 </div>
 </body>
 </html>
@@ -1867,6 +1938,11 @@ h1{margin:0;font-weight:800;font-size:22px}
 .logout-btn:hover{background:#ff4757}
 .user-badge{display:inline-flex;align-items:center;gap:6px;padding:10px 12px;border-radius:12px;background:#1c2129;color:var(--text);font-weight:600;box-shadow:var(--shadow)}
 .section-title{margin:18px 0 10px;font-size:18px;font-weight:800}
+.section-header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:18px 0 10px}
+.section-header .section-title{margin:0}
+.sort-form{display:flex;align-items:center;gap:8px}
+.sort-form label{font-size:13px;color:var(--muted)}
+.sort-select{background:#151b23;border:1px solid #242c37;color:var(--text);padding:8px 12px;border-radius:12px;cursor:pointer;box-shadow:var(--shadow)}
 .grid{display:grid;gap:22px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
 .card{background:var(--card);border-radius:16px;overflow:hidden;transition:.25s;box-shadow:var(--shadow)}
 .card:hover{transform:scale(1.02);background:var(--card2)}
@@ -1879,12 +1955,16 @@ h1{margin:0;font-weight:800;font-size:22px}
 .muted{color:var(--muted)}
 .lock{font-size:12px;color:#9aa4b2;margin-left:6px}
 .hidden{display:none!important}
-@media(max-width:900px){.container{padding:20px}.grid{gap:16px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}}
+@media(max-width:900px){.container{padding:20px}.grid{gap:16px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.section-header{flex-direction:column;align-items:flex-start;gap:12px}.sort-form{width:100%}.sort-select{width:100%}}
 .badge{display:inline-flex;align-items:center;gap:6px;padding:10px 12px;border-radius:12px;background:#1c2129;color:var(--muted)}
 </style>
 
 <script>
 let aborter=null;
+function currentSortValue(){
+  const select=document.getElementById('sortSelect');
+  return select?select.value:'name';
+}
 async function doSearch(q){
   const sectionCats=document.getElementById('section-cats');
   const gridVids=document.getElementById('grid-vids');
@@ -1898,7 +1978,8 @@ async function doSearch(q){
   try{
     if(aborter) aborter.abort();
     aborter=new AbortController();
-    const res=await fetch('/api/search?q='+encodeURIComponent(q),{signal:aborter.signal});
+    const sort=currentSortValue();
+    const res=await fetch('/api/search?q='+encodeURIComponent(q)+'&sort='+encodeURIComponent(sort),{signal:aborter.signal});
     const data=await res.json();
     gridVids.innerHTML=(data.results||[]).map(v=>`
       <div class=\"card\">
@@ -1952,13 +2033,14 @@ document.addEventListener('DOMContentLoaded',()=>{
 </head>
 <body>
 <div class=\"container\">
+  {% set sort_arg = sort_mode if sort_mode != 'name' else None %}
   <div class=\"header\">
     <div>
       <div class=\"breadcrumbs\">
         {% if crumbs %}
           {% for c in crumbs %}
             {% if not loop.last %}
-              <a href=\"{{ url_for('browse', subpath=c.path) }}\">{{ c.name }}</a> /
+              <a href=\"{{ url_for('browse', subpath=c.path, sort=sort_arg) }}\">{{ c.name }}</a> /
             {% else %}
               <span class=\"muted\">{{ c.name }}</span>
             {% endif %}
@@ -2000,11 +2082,11 @@ document.addEventListener('DOMContentLoaded',()=>{
         {% for folder in subfolders %}
           <div class=\"card\">
             {% if folder['raw_path'] in protected and not is_admin %}
-              <a href=\"{{ url_for('access_folder', subpath=folder['raw_path']) }}\">
+              <a href=\"{{ url_for('access_folder', subpath=folder['raw_path'], sort=sort_arg) }}\">
                 <div class=\"title\">{{ folder['name'] }} <span class=\"lock\">({{ ui['locked'] }})</span></div>
               </a>
             {% else %}
-              <a href=\"{{ url_for('browse', subpath=folder['raw_path']) }}\">
+              <a href=\"{{ url_for('browse', subpath=folder['raw_path'], sort=sort_arg) }}\">
                 <div class=\"title\">{{ folder['name'] }}</div>
               </a>
             {% endif %}
@@ -2014,7 +2096,17 @@ document.addEventListener('DOMContentLoaded',()=>{
     {% endif %}
   </div>
 
-  <div class=\"section-title\">{{ ui['videos'] }}</div>
+  <div class=\"section-header\">
+    <div class=\"section-title\">{{ ui['videos'] }}</div>
+    <form class=\"sort-form\" method=\"get\" action=\"{{ url_for('browse', subpath=current_path) }}\">
+      <label for=\"sortSelect\">{{ ui['sort_by'] }}:</label>
+      <select id=\"sortSelect\" name=\"sort\" class=\"sort-select\" onchange=\"this.form.submit()\">
+        {% for key, label in sort_options %}
+          <option value=\"{{ key }}\" {% if sort_mode == key %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </form>
+  </div>
   <div id=\"grid-vids\" class=\"grid\">
     {% if videos %}
       {% for v in videos %}
@@ -3065,6 +3157,8 @@ def require_access_for(rel_path: str) -> Optional[Response]:
 @app.route("/<path:subpath>", methods=["GET","POST"], endpoint="browse")
 def browse(subpath):
     lang, ui = get_lang()
+    sort_mode = resolve_sort_mode()
+    sort_options = build_sort_options(ui)
     is_admin = is_admin_request(request)
 
     dir_abs = safe_join(VIDEO_ROOT, subpath)
@@ -3076,13 +3170,14 @@ def browse(subpath):
             if hashlib.sha256(pw.encode()).hexdigest() == _protected.get(subpath):
                 remember_folder_access(subpath)
             else:
-                return render_template_string(TEMPLATE_ACCESS, error=ui["wrong_pass"], path=subpath, lang=lang, ui=ui)
+                return render_template_string(TEMPLATE_ACCESS, error=ui["wrong_pass"], path=subpath, lang=lang, ui=ui, sort_mode=sort_mode)
         else:
-            return render_template_string(TEMPLATE_ACCESS, error=None, path=subpath, lang=lang, ui=ui)
+            return render_template_string(TEMPLATE_ACCESS, error=None, path=subpath, lang=lang, ui=ui, sort_mode=sort_mode)
 
     subfolders = list_subfolders(dir_abs)
     videos     = list_videos_in_dir(dir_abs, lang)
-    enrich_cards_with_stats(videos)
+    enrich_cards_with_stats(videos, include_favorites=True)
+    apply_sort(videos, sort_mode)
 
     title = ui["title_main"] if not subpath else subpath
     crumbs = breadcrumbs_for(subpath)
@@ -3091,17 +3186,22 @@ def browse(subpath):
         title=title, subfolders=subfolders, videos=videos,
         crumbs=crumbs, lang=lang, ui=ui,
         protected=_protected, is_admin=is_admin,
-        current_user=g.user
+        current_user=g.user,
+        sort_mode=sort_mode, sort_options=sort_options,
+        current_path=subpath
     )
 
 
 @app.route("/access/<path:subpath>", methods=["GET", "POST"])
 def access_folder(subpath):
     lang, ui = get_lang()
+    sort_mode = resolve_sort_mode()
+    sort_options = build_sort_options(ui)
+    sort_arg = sort_mode if sort_mode != "name" else None
     if subpath not in _protected:
-        return redirect(url_for("browse", subpath=subpath))
+        return redirect(url_for("browse", subpath=subpath, sort=sort_arg))
     if is_admin_request(request) or user_has_persistent_access(subpath):
-        return redirect(url_for("browse", subpath=subpath))
+        return redirect(url_for("browse", subpath=subpath, sort=sort_arg))
     if request.method == "POST":
         pw = request.form.get("password", "")
         if hashlib.sha256(pw.encode()).hexdigest() == _protected.get(subpath):
@@ -3110,18 +3210,21 @@ def access_folder(subpath):
             if not os.path.isdir(dir_abs): abort(404)
             subfolders = list_subfolders(dir_abs)
             videos = list_videos_in_dir(dir_abs, lang)
-            enrich_cards_with_stats(videos)
+            enrich_cards_with_stats(videos, include_favorites=True)
+            apply_sort(videos, sort_mode)
             title = ui["title_main"] if not subpath else subpath
             crumbs = breadcrumbs_for(subpath)
             return render_template_string(TEMPLATE_MAIN,
                 title=title, subfolders=subfolders, videos=videos,
                 crumbs=crumbs, lang=lang, ui=ui,
                 protected=_protected, is_admin=is_admin_request(request),
-                current_user=g.user
+                current_user=g.user,
+                sort_mode=sort_mode, sort_options=sort_options,
+                current_path=subpath
             )
         else:
-            return render_template_string(TEMPLATE_ACCESS, error=ui["wrong_pass"], path=subpath, lang=lang, ui=ui)
-    return render_template_string(TEMPLATE_ACCESS, error=None, path=subpath, lang=lang, ui=ui)
+            return render_template_string(TEMPLATE_ACCESS, error=ui["wrong_pass"], path=subpath, lang=lang, ui=ui, sort_mode=sort_mode)
+    return render_template_string(TEMPLATE_ACCESS, error=None, path=subpath, lang=lang, ui=ui, sort_mode=sort_mode)
 
 @app.route("/watch/<path:filepath>")
 def watch_video(filepath):
@@ -3448,6 +3551,9 @@ def require_auth_api():
 def api_search():
     lang, _ = get_lang()
     q = (request.args.get("q") or "").strip().lower()
+    sort_mode = request.args.get("sort") or "name"
+    if sort_mode not in SORT_MODES:
+        sort_mode = "name"
     results = []
     if q:
         refresh_video_index()
@@ -3459,9 +3565,9 @@ def api_search():
             search_key = base.get(f"search_key_{lang}") or base_display_name(base, lang).lower()
             if q in search_key:
                 matches.append(localized_video_entry(base, lang))
-        matches.sort(key=lambda item: item["display"].lower())
+        enrich_cards_with_stats(matches, include_favorites=True)
+        apply_sort(matches, sort_mode)
         results = matches[:SEARCH_RESULT_LIMIT]
-        enrich_cards_with_stats(results)
     return jsonify({"results": results})
 
 
