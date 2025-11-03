@@ -1558,32 +1558,48 @@ def build_recommendation_pool(current_path: str, lang: str, current_author: Opti
     candidate_paths: List[str] = []
     seen: set = set()
     sequence_scores = get_sequence_neighbors(current_path, limit=desired * 2)
-    for path, weight in sequence_scores.items():
-        if path == current_path or path in seen:
-            continue
-        candidate_paths.append(path)
-        seen.add(path)
-    if current_author:
+
+    def add_candidate(raw_path: str, *, allow_same_dir: bool = False) -> None:
+        normalized = normalize_rel_path(raw_path)
+        if not normalized or normalized == current_path or normalized in seen:
+            return
+        if normalized not in VIDEO_INDEX:
+            return
+        if not allow_same_dir and current_dir_prefix and normalized.startswith(current_dir_prefix):
+            if sequence_scores.get(normalized, 0.0) <= 0.0:
+                return
+        candidate_paths.append(normalized)
+        seen.add(normalized)
+
+    for path, _ in sorted(sequence_scores.items(), key=lambda item: item[1], reverse=True):
+        add_candidate(path, allow_same_dir=True)
+        if len(candidate_paths) >= desired:
+            break
+
+    if len(candidate_paths) < desired and current_author:
         for path in AUTHOR_VIDEO_INDEX.get(current_author, []):
-            if path == current_path or path in seen:
-                continue
-            candidate_paths.append(path)
-            seen.add(path)
-    for path in get_popular_videos(desired):
-        if path == current_path or path in seen:
-            continue
-        candidate_paths.append(path)
-        seen.add(path)
-    if len(candidate_paths) < desired:
-        for path in VIDEO_INDEX.keys():
-            if path == current_path or path in seen:
-                continue
-            if current_dir_prefix and path.startswith(current_dir_prefix):
-                continue
-            candidate_paths.append(path)
-            seen.add(path)
+            add_candidate(path)
             if len(candidate_paths) >= desired:
                 break
+
+    if len(candidate_paths) < desired:
+        for path in get_popular_videos(desired * 2):
+            add_candidate(path)
+            if len(candidate_paths) >= desired:
+                break
+
+    if len(candidate_paths) < desired:
+        for path in list(VIDEO_INDEX.keys()):
+            add_candidate(path)
+            if len(candidate_paths) >= desired:
+                break
+
+    if len(candidate_paths) < desired:
+        for path in list(VIDEO_INDEX.keys()):
+            add_candidate(path, allow_same_dir=True)
+            if len(candidate_paths) >= desired:
+                break
+
     entries = collect_video_entries(candidate_paths, lang)
     for entry in entries:
         entry["_sequence_weight"] = sequence_scores.get(entry["path"], 0.0)
@@ -1597,20 +1613,30 @@ def compute_recommendation_score(
     author_weights: Optional[Dict[str, float]] = None,
     watched_paths: Optional[Set[str]] = None,
     now_ts: Optional[float] = None,
+    max_sequence_weight: float = 0.0,
 ) -> float:
     score = 0.0
-    score += entry.get("views", 0) * 0.1
-    score += entry.get("likes", 0) * 3.0
+    score += entry.get("views", 0) * 0.08
+    score += entry.get("likes", 0) * 2.8
     score -= entry.get("dislikes", 0) * 1.5
-    score += entry.get("favorites", 0) * 5.0
+    score += entry.get("favorites", 0) * 4.5
     seq_weight = float(entry.get("_sequence_weight") or 0.0)
-    if seq_weight:
-        score += seq_weight * 8.0
+    if seq_weight > 0.0:
+        if max_sequence_weight > 0.0:
+            score += 120.0 * (seq_weight / max_sequence_weight)
+        else:
+            score += seq_weight * 12.0
     author = entry.get("author")
+    same_directory = bool(current_dir_prefix and entry["path"].startswith(current_dir_prefix))
     if current_author and author == current_author:
-        score += 40.0
-    if current_dir_prefix and entry["path"].startswith(current_dir_prefix):
-        score += 20.0
+        score += 18.0 if (seq_weight > 0.0 or not same_directory) else 8.0
+    if same_directory:
+        if seq_weight > 0.0:
+            score += 6.0
+        else:
+            score -= 18.0
+    else:
+        score += 4.0
     weights = author_weights or {}
     if author and author in weights:
         score += weights[author] * 7.0
@@ -1631,6 +1657,13 @@ def recommend_videos(current_path: str, videos: List[Dict], current_author: Opti
     author_weights = user_author_weights()
     watched_paths = user_watched_paths()
     reference_ts = time.time()
+    max_sequence_weight = 0.0
+    for entry in videos:
+        if entry["path"] == current_path:
+            continue
+        seq_weight = float(entry.get("_sequence_weight") or 0.0)
+        if seq_weight > max_sequence_weight:
+            max_sequence_weight = seq_weight
     for entry in videos:
         if entry["path"] == current_path:
             continue
@@ -1643,6 +1676,7 @@ def recommend_videos(current_path: str, videos: List[Dict], current_author: Opti
                 author_weights,
                 watched_paths,
                 reference_ts,
+                max_sequence_weight,
             ),
             entry_copy,
         ))
