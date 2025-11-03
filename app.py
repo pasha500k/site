@@ -35,7 +35,7 @@ app.config["SECRET_KEY"] = os.environ.get("APP_SECRET_KEY", "change-me")
 # -------------------------
 # CONFIG
 # -------------------------
-VIDEO_ROOT    = r"C:\Users\pavel\PycharmProjects\PH_Dowloader_TG+WEB\downloads"
+VIDEO_ROOT    = r"E:\PH_Dowloader_TG+WEB\downloads"
 PREVIEW_ROOT  = os.path.join(VIDEO_ROOT, "__previews__")
 UPLOAD_ROOT   = os.path.join(VIDEO_ROOT, "__uploads__")
 ALLOWED_EXT   = {".mp4"}
