@@ -55,6 +55,10 @@ os.makedirs(PREVIEW_ROOT, exist_ok=True)
 os.makedirs(UPLOAD_ROOT, exist_ok=True)
 os.makedirs(VIDEO_ROOT, exist_ok=True)
 
+FFMPEG_CHECK_TIMEOUT = int(os.environ.get("FFMPEG_CHECK_TIMEOUT", "180"))
+FFMPEG_FIX_COPY_TIMEOUT = int(os.environ.get("FFMPEG_FIX_COPY_TIMEOUT", "900"))
+FFMPEG_FIX_TRANSCODE_TIMEOUT = int(os.environ.get("FFMPEG_FIX_TRANSCODE_TIMEOUT", "1800"))
+
 # -------------------------
 # METADATA FILES
 # -------------------------
@@ -4272,43 +4276,119 @@ def admin_protect():
 
 
 # ---------- Fix / Delete ----------
-def ffmpeg_check(video_path: str) -> bool:
+def ffmpeg_check(video_path: str, timeout: int = FFMPEG_CHECK_TIMEOUT) -> bool:
     try:
-        res = subprocess.run(
-            ["ffmpeg","-v","error","-i",video_path,"-f","null","-"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v","error",
+                "-select_streams","v:0",
+                "-show_entries","stream=codec_type",
+                "-of","default=noprint_wrappers=1:nokey=1",
+                video_path
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(10, min(timeout, 300))
         )
-        return (res.returncode == 0) and (not res.stderr.strip())
+        if probe.returncode == 0:
+            return True
+    except subprocess.TimeoutExpired:
+        pass
     except Exception:
         return False
 
+    try:
+        res = subprocess.run(
+            ["ffmpeg","-v","error","-i",video_path,"-f","null","-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout
+        )
+        if res.returncode != 0:
+            return False
+        err_output = (res.stderr or b"").decode(errors="ignore").strip()
+        return not err_output
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return False
+    return False
+
 
 def ffmpeg_fix(video_path: str) -> bool:
-    tmp = video_path + ".fixed.mp4"
-    try:
-        subprocess.run(
-            ["ffmpeg","-y","-i",video_path,"-c","copy","-movflags","+faststart", tmp],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
+    rel_path = os.path.relpath(video_path, VIDEO_ROOT).replace("\\", "/")
+    attempt_specs = [
+        (
+            lambda tmp: [
+                "ffmpeg","-y","-fflags","+genpts","-i",video_path,
+                "-map","0","-c","copy","-movflags","+faststart", tmp
+            ],
+            FFMPEG_FIX_COPY_TIMEOUT
+        ),
+        (
+            lambda tmp: [
+                "ffmpeg","-y","-i",video_path,
+                "-map","0:v:0","-map","0:a:0?","-map","0:s?",
+                "-c:v","libx264","-preset","veryfast","-crf","20",
+                "-c:a","aac","-b:a","192k",
+                "-movflags","+faststart", tmp
+            ],
+            FFMPEG_FIX_TRANSCODE_TIMEOUT
         )
-        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-            os.replace(tmp, video_path); return True
-    except Exception:
-        pass
-    try:
-        subprocess.run(
-            ["ffmpeg","-y","-i",video_path,
-             "-c:v","libx264","-preset","veryfast","-crf","20",
-             "-c:a","aac","-b:a","192k","-movflags","+faststart", tmp],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600
-        )
-        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-            os.replace(tmp, video_path); return True
-    except Exception:
-        pass
-    try:
-        if os.path.exists(tmp): os.remove(tmp)
-    except Exception:
-        pass
+    ]
+
+    for idx, (builder, timeout) in enumerate(attempt_specs, start=1):
+        tmp_path = f"{video_path}.fix{idx}.mp4"
+        try:
+            result = subprocess.run(
+                builder(tmp_path),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False
+            )
+            if result.returncode != 0:
+                continue
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                continue
+            if not ffmpeg_check(tmp_path):
+                continue
+            os.replace(tmp_path, video_path)
+            _dur_cache.pop(rel_path, None)
+            save_dur_cache()
+            thumb = os.path.splitext(video_path)[0] + ".jpg"
+            try:
+                if os.path.exists(thumb):
+                    os.remove(thumb)
+            except Exception:
+                pass
+            try:
+                preview_rel = os.path.splitext(os.path.relpath(video_path, VIDEO_ROOT))[0] + ".preview.mp4"
+                preview_abs = os.path.join(PREVIEW_ROOT, preview_rel)
+                if os.path.exists(preview_abs):
+                    os.remove(preview_abs)
+            except Exception:
+                pass
+            try:
+                generate_thumbnail(video_path)
+            except Exception:
+                pass
+            try:
+                ensure_preview(video_path)
+            except Exception:
+                pass
+            return True
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            continue
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
     return False
 
 
