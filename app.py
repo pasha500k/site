@@ -117,6 +117,9 @@ COLLAB_CACHE_TTL = 180.0
 COLLAB_CACHE_MAX = 800
 COLLAB_CACHE_LOCK = threading.Lock()
 
+# shorts configuration (seconds)
+SHORTS_MAX_DURATION = float(os.environ.get("SHORTS_MAX_DURATION", "120"))
+
 
 def mark_popular_dirty() -> None:
     global POPULAR_CACHE_DIRTY
@@ -212,6 +215,13 @@ def init_db():
                 folder_path TEXT NOT NULL,
                 granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(user_id, folder_path),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS author_subscriptions (
+                user_id INTEGER NOT NULL,
+                author TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, author),
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS user_stats (
@@ -825,6 +835,8 @@ UI_TEXT = {
         "quality": "Quality", "original": "Original", "login": "Login", "logout": "Logout",
         "register": "Register", "account": "Account", "too_many_attempts": "Too many attempts, try later",
         "author": "Author", "recommendations": "Recommended for you", "upload": "Upload",
+        "shorts": "Shorts", "subscribe": "Subscribe", "unsubscribe": "Unsubscribe",
+        "subscribed": "Subscribed", "shorts_empty": "No shorts yet",
         "account_stats": "Stats", "admin_panel": "Admin panel", "moderator_panel": "Moderator panel",
         "pending_uploads": "Pending uploads", "approve": "Approve", "reject": "Reject", "notes": "Notes",
         "target_folder": "Target folder", "status_pending": "Pending", "status_approved": "Approved",
@@ -859,6 +871,8 @@ UI_TEXT = {
         "quality": "Качество", "original": "Оригинал", "login": "Войти", "logout": "Выйти",
         "register": "Регистрация", "account": "Аккаунт", "too_many_attempts": "Слишком много попыток, попробуйте позже",
         "author": "Автор", "recommendations": "Рекомендации", "upload": "Загрузить",
+        "shorts": "Шортсы", "subscribe": "Подписаться", "unsubscribe": "Отписаться",
+        "subscribed": "Вы подписаны", "shorts_empty": "Нет коротких видео",
         "account_stats": "Статистика", "admin_panel": "Панель админа", "moderator_panel": "Панель модератора",
         "pending_uploads": "Ожидают модерации", "approve": "Одобрить", "reject": "Отклонить",
         "notes": "Комментарий", "target_folder": "Папка назначения", "status_pending": "Ожидает",
@@ -1687,6 +1701,17 @@ def list_all_videos(lang: str) -> List[Dict]:
     return [localized_video_entry(base, lang) for base in list(VIDEO_INDEX.values())]
 
 
+def list_short_videos(lang: str) -> List[Dict]:
+    refresh_video_index()
+    shorts: List[Dict] = []
+    for base in list(VIDEO_INDEX.values()):
+        duration_seconds = float(base.get("duration_seconds") or 0.0)
+        if duration_seconds <= 0.0 or duration_seconds > SHORTS_MAX_DURATION:
+            continue
+        shorts.append(localized_video_entry(base, lang))
+    return shorts
+
+
 def attach_secure_urls(videos: List[Dict]):
     for v in videos:
         sc = get_protected_root_for(v["path"])
@@ -1760,6 +1785,17 @@ def build_recommendation_pool(current_path: str, lang: str, current_author: Opti
             add_candidate(path, allow_same_dir=True)
             if len(candidate_paths) >= desired:
                 break
+
+    if len(candidate_paths) < desired:
+        subscriptions = user_subscriptions_set()
+        if subscriptions:
+            for author in subscriptions:
+                for path in AUTHOR_VIDEO_INDEX.get(author, [])[:desired]:
+                    add_candidate(path, allow_same_dir=True)
+                    if len(candidate_paths) >= desired:
+                        break
+                if len(candidate_paths) >= desired:
+                    break
 
     if len(candidate_paths) < desired and current_author:
         for path in AUTHOR_VIDEO_INDEX.get(current_author, []):
@@ -2078,6 +2114,37 @@ def user_watched_paths() -> Set[str]:
     return watched
 
 
+def normalize_author_name(author: Optional[str]) -> Optional[str]:
+    if author is None:
+        return None
+    normalized = author.strip()
+    return normalized or None
+
+
+def user_subscriptions_set() -> Set[str]:
+    user = getattr(g, "user", None)
+    if user is None:
+        return set()
+    cached = getattr(g, "_author_subscriptions", None)
+    if cached is not None:
+        return cached
+    db = get_db()
+    rows = db.execute(
+        "SELECT author FROM author_subscriptions WHERE user_id = ?",
+        (user["id"],),
+    ).fetchall()
+    subs = {row["author"] for row in rows if row["author"]}
+    g._author_subscriptions = subs
+    return subs
+
+
+def is_author_subscribed(author: Optional[str]) -> bool:
+    normalized = normalize_author_name(author)
+    if not normalized:
+        return False
+    return normalized in user_subscriptions_set()
+
+
 def user_author_weights() -> Dict[str, float]:
     user = getattr(g, "user", None)
     if user is None:
@@ -2111,6 +2178,8 @@ def user_author_weights() -> Dict[str, float]:
         if not author:
             continue
         weights[author] = weights.get(author, 0.0) + 3.0
+    for author in user_subscriptions_set():
+        weights[author] = weights.get(author, 0.0) + 18.0
     g._author_weights = weights
     return weights
 
@@ -2349,6 +2418,7 @@ document.addEventListener('DOMContentLoaded',()=>{
       <input class=\"input\" placeholder=\"{{ ui['search_placeholder'] }}\" oninput=\"doSearch(this.value)\">
       <a class=\"button\" href=\"{{ url_for('random_video') }}\">🎲 {{ ui['random'] }}</a>
       <a class=\"button\" href=\"{{ url_for('random_settings') }}\">🎛 {{ ui['random_settings'] }}</a>
+      <a class=\"button\" href=\"{{ url_for('shorts_page') }}\">🎞 {{ ui['shorts'] }}</a>
       {% if current_user %}
         <span class=\"user-badge\">👤 {{ current_user['username'] }}</span>
         <a class=\"button\" href=\"{{ url_for('upload_video') }}\">⬆️ {{ ui['upload'] }}</a>
@@ -2431,6 +2501,196 @@ document.addEventListener('DOMContentLoaded',()=>{
 </html>
 """
 
+TEMPLATE_SHORTS = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>🎞 {{ ui['shorts'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+:root{--bg:#0d1117;--card:#11151b;--text:#e6edf3;--muted:#9aa4b2;--accent:#238636;--accent2:#2ea043;--shadow:0 10px 30px rgba(0,0,0,.35)}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:\"Inter\",\"Segoe UI\",Arial,sans-serif;margin:0}
+.container{max-width:960px;margin:auto;padding:20px}
+.header{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.button{background:var(--accent);color:#fff;border:0;padding:10px 14px;border-radius:12px;text-decoration:none;display:inline-flex;gap:8px;align-items:center;box-shadow:var(--shadow);transition:.25s}
+.button:hover{background:var(--accent2);transform:scale(1.03)}
+.logout-btn{background:#dc3545}
+.logout-btn:hover{background:#ff4757}
+.user-badge{display:inline-flex;align-items:center;gap:6px;padding:10px 12px;border-radius:12px;background:#1c2129;color:var(--text);font-weight:600;box-shadow:var(--shadow)}
+h1{margin:10px 0 16px;font-size:24px;font-weight:800}
+.sort-bar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin:18px 0}
+.sort-select{background:#151b23;border:1px solid #242c37;color:var(--text);padding:8px 12px;border-radius:12px;cursor:pointer;box-shadow:var(--shadow)}
+.shorts{display:flex;flex-direction:column;gap:24px}
+.card{background:var(--card);border-radius:16px;box-shadow:var(--shadow);padding:16px;display:flex;flex-direction:column;gap:12px}
+.short-video{width:100%;border-radius:12px;background:#000;max-height:70vh}
+.stats{display:flex;gap:12px;align-items:center;flex-wrap:wrap;color:var(--muted)}
+.btn{background:#222b35;color:#fff;border:0;padding:8px 12px;border-radius:10px;cursor:pointer;transition:.2s}
+.btn:hover{background:#2a3440}
+.btn.subscribe.active{background:#238636}
+.muted{color:var(--muted)}
+@media(max-width:700px){.container{padding:14px}}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>🎞 {{ ui['shorts'] }}</h1>
+    <div class="toolbar">
+      <a class="button" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
+      <a class="button" href="{{ url_for('random_video') }}">🎲 {{ ui['random'] }}</a>
+      {% if current_user %}
+        <span class="user-badge">👤 {{ current_user['username'] }}</span>
+        <a class="button" href="{{ url_for('upload_video') }}">⬆️ {{ ui['upload'] }}</a>
+        <a class="button" href="{{ url_for('favorites_page') }}">❤️ {{ ui['favorites'] }}</a>
+        <a class="button logout-btn" href="{{ url_for('logout', next=request.full_path if request.query_string else request.path) }}">🚪 {{ ui['logout'] }}</a>
+      {% else %}
+        <a class="button" href="{{ url_for('login', next=request.full_path if request.query_string else request.path) }}">🔑 {{ ui['login'] }}</a>
+        <a class="button" href="{{ url_for('register', next=request.full_path if request.query_string else request.path) }}">🆕 {{ ui['register'] }}</a>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="sort-bar">
+    <div>{{ ui['sort_by'] }}:</div>
+    <form method="get" action="{{ url_for('shorts_page') }}">
+      <select class="sort-select" name="sort" onchange="this.form.submit()">
+        {% for key, label in sort_options %}
+          <option value="{{ key }}" {% if sort_mode == key %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </form>
+  </div>
+
+  <div class="shorts" id="shorts-list">
+    {% if shorts %}
+      {% for item in shorts %}
+        <div class="card" data-path="{{ item['path'] }}" data-author="{{ item.get('author') or '' }}">
+          <video class="short-video" playsinline webkit-playsinline muted loop preload="none" poster="{{ item['thumb_url'] }}" data-src="{{ item['file_url'] }}" controls></video>
+          <div class="stats">
+            <span>👁 {{ item.get('views', 0) }}</span>
+            <span>👍 <span class="like-count">{{ item.get('likes', 0) }}</span></span>
+            <span>⏱ {{ item['duration'] }}</span>
+            <span>👤 {{ item.get('author') or '—' }}</span>
+          </div>
+          <div class="stats">
+            <button class="btn like-btn">👍 {{ ui['like'] }}</button>
+            {% if item.get('author') %}
+              <button class="btn subscribe {% if item.get('subscribed') %}active{% endif %}">
+                {% if item.get('subscribed') %}{{ ui['subscribed'] }}{% else %}{{ ui['subscribe'] }}{% endif %}
+              </button>
+            {% endif %}
+            <a class="button" href="{{ item['watch_url'] }}">▶️ {{ ui['videos'] }}</a>
+          </div>
+        </div>
+      {% endfor %}
+    {% else %}
+      <p class="muted">{{ ui['shorts_empty'] }}</p>
+    {% endif %}
+  </div>
+</div>
+<script>
+(function(){
+  const isAuth={{ 'true' if current_user else 'false' }};
+  const loginUrl={{ url_for('login', next=request.full_path if request.query_string else request.path)|tojson }};
+  const likeUrl={{ url_for('api_like')|tojson }};
+  const subscribeUrl={{ url_for('api_subscribe_author')|tojson }};
+  const unsubscribeUrl={{ url_for('api_unsubscribe_author')|tojson }};
+
+  function ensureSource(video){
+    if(!video.src){
+      video.src=video.dataset.src;
+    }
+  }
+
+  document.querySelectorAll('.short-video').forEach(video=>{
+    video.addEventListener('play',()=>ensureSource(video),{once:true});
+    video.addEventListener('click',()=>{
+      ensureSource(video);
+      video.play().catch(()=>{});
+    });
+  });
+
+  async function postReaction(path){
+    const res=await fetch(likeUrl,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path})
+    });
+    if(res.status===401){
+      window.location=loginUrl;
+      return null;
+    }
+    if(!res.ok){
+      return null;
+    }
+    return res.json();
+  }
+
+  async function toggleSubscription(author, subscribe){
+    const target=subscribe?subscribeUrl:unsubscribeUrl;
+    const res=await fetch(target,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({author})
+    });
+    if(res.status===401){
+      window.location=loginUrl;
+      return null;
+    }
+    if(!res.ok){
+      return null;
+    }
+    return res.json();
+  }
+
+  document.querySelectorAll('.card').forEach(card=>{
+    const path=card.dataset.path;
+    const author=(card.dataset.author||'').trim();
+    const likeBtn=card.querySelector('.like-btn');
+    const likeCountEl=card.querySelector('.like-count');
+    const subscribeBtn=card.querySelector('.subscribe');
+
+    if(likeBtn){
+      likeBtn.addEventListener('click',async()=>{
+        if(!isAuth){
+          window.location=loginUrl;
+          return;
+        }
+        const data=await postReaction(path);
+        if(data && likeCountEl){
+          likeCountEl.textContent=data.likes;
+        }
+      });
+    }
+
+    if(subscribeBtn && author){
+      subscribeBtn.addEventListener('click',async()=>{
+        if(!isAuth){
+          window.location=loginUrl;
+          return;
+        }
+        const subscribing=!subscribeBtn.classList.contains('active');
+        const data=await toggleSubscription(author, subscribing);
+        if(data){
+          if(subscribing){
+            subscribeBtn.classList.add('active');
+            subscribeBtn.textContent={{ ui['subscribed']|tojson }};
+          }else{
+            subscribeBtn.classList.remove('active');
+            subscribeBtn.textContent={{ ui['subscribe']|tojson }};
+          }
+        }
+      });
+    }
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
 TEMPLATE_VIDEO = """<!doctype html>
 <html lang="{{ 'ru' if lang=='ru' else 'en' }}">
 <head>
@@ -2469,7 +2729,7 @@ h1{
   flex-wrap:wrap;
   margin-bottom:12px;
 }
-.btn{
+.btn{ 
   background:#222b35;
   color:#fff;
   border:0;
@@ -2480,6 +2740,9 @@ h1{
   transition:.2s;
 }
 .btn:hover{background:#2a3440}
+.btn.subscribe.active{background:#238636}
+.btn.subscribe.active:hover{background:#2ea043}
+.btn.disabled{opacity:0.6;cursor:not-allowed}
 .btn.logout{background:#dc3545}
 .btn.logout:hover{background:#ff4757}
 .btn.del{background:#dc3545}
@@ -2569,6 +2832,11 @@ video {
     <button class="btn" id="like">👍 <span id="likes">{{ likes }}</span></button>
     <button class="btn" id="dislike">👎 <span id="dislikes">{{ dislikes }}</span></button>
     <button class="btn" id="fav"><span id="favLabel">❤️ {% if fav %}★{% endif %}</span></button>
+    {% if author %}
+      <button class="btn subscribe {% if author_subscribed %}active{% endif %}" id="subscribeBtn">
+        {% if author_subscribed %}{{ ui['subscribed'] }}{% else %}{{ ui['subscribe'] }}{% endif %}
+      </button>
+    {% endif %}
     <span class="badge">{{ duration }}</span>
     <span class="badge">👤 {{ ui['author'] }}: {{ author or '—' }}</span>
   </div>
@@ -2623,10 +2891,14 @@ video {
   const dislikeBtn=document.getElementById('dislike');
   const favBtn=document.getElementById('fav');
   const favLabel=document.getElementById('favLabel');
+  const subscribeBtn=document.getElementById('subscribeBtn');
   const loginRedirect={{ url_for('login', next=request_path)|tojson }};
   const registerRedirect={{ url_for('register', next=request_path)|tojson }};
   const stateUrl={{ url_for('api_state')|tojson }};
   const videoPath={{ filepath|tojson }};
+  const authorName={{ (author or '')|tojson }};
+  const subscribeUrl={{ url_for('api_subscribe_author')|tojson }};
+  const unsubscribeUrl={{ url_for('api_unsubscribe_author')|tojson }};
   const progressUrl={{ url_for('api_watch_progress')|tojson }};
   const watchSession={{ watch_session_id|tojson }};
   const durationSeconds={{ video_duration_seconds|tojson }};
@@ -2664,7 +2936,8 @@ video {
 
   async function refreshState(){
     try{
-      const res=await fetch(`${stateUrl}?path=${encodeURIComponent(videoPath)}`);
+      const authorParam=authorName?`&author=${encodeURIComponent(authorName)}`:'';
+      const res=await fetch(`${stateUrl}?path=${encodeURIComponent(videoPath)}${authorParam}`);
       if(!res.ok) return;
       const data=await res.json();
       document.getElementById('likes').textContent=data.likes;
@@ -2673,6 +2946,15 @@ video {
         favLabel.textContent='❤️ ★';
       }else{
         favLabel.textContent='❤️';
+      }
+      if(subscribeBtn){
+        if(data.author_subscribed){
+          subscribeBtn.classList.add('active');
+          subscribeBtn.textContent={{ ui['subscribed']|tojson }};
+        }else{
+          subscribeBtn.classList.remove('active');
+          subscribeBtn.textContent={{ ui['subscribe']|tojson }};
+        }
       }
       if(data.user_reaction==='like'){
         likeBtn.classList.add('active');
@@ -2688,10 +2970,12 @@ video {
         likeBtn.classList.add('disabled');
         dislikeBtn.classList.add('disabled');
         favBtn.classList.add('disabled');
+        if(subscribeBtn){subscribeBtn.classList.add('disabled');}
       }else{
         likeBtn.classList.remove('disabled');
         dislikeBtn.classList.remove('disabled');
         favBtn.classList.remove('disabled');
+        if(subscribeBtn){subscribeBtn.classList.remove('disabled');}
       }
     }catch(e){console.error(e);}
   }
@@ -2701,6 +2985,22 @@ video {
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({path: videoPath})
+    });
+    if(res.status===401){
+      window.location=loginRedirect;
+      return null;
+    }
+    if(!res.ok){
+      return null;
+    }
+    return res.json();
+  }
+
+  async function postAuthor(url){
+    const res=await fetch(url,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({author: authorName})
     });
     if(res.status===401){
       window.location=loginRedirect;
@@ -2744,6 +3044,24 @@ video {
       refreshState();
     }
   });
+
+  if(subscribeBtn && authorName){
+    subscribeBtn.addEventListener('click', async()=>{
+      if(subscribeBtn.classList.contains('disabled')){window.location=loginRedirect;return;}
+      const subscribing=!subscribeBtn.classList.contains('active');
+      const url=subscribing?subscribeUrl:unsubscribeUrl;
+      const data=await postAuthor(url);
+      if(data){
+        if(subscribing){
+          subscribeBtn.classList.add('active');
+          subscribeBtn.textContent={{ ui['subscribed']|tojson }};
+        }else{
+          subscribeBtn.classList.remove('active');
+          subscribeBtn.textContent={{ ui['subscribe']|tojson }};
+        }
+      }
+    });
+  }
 
   if(videoEl){
     videoEl.addEventListener('play',()=>{
@@ -3548,6 +3866,7 @@ def watch_video(filepath):
     current_dir_prefix= (current_dir_rel + "/") if current_dir_rel != "." else ""
 
     current_author = author_for_path(filepath)
+    author_subscribed = is_author_subscribed(current_author)
 
     same_dir = [v for v in list_videos_in_dir(current_dir_abs, lang) if v["path"] != filepath]
     enrich_cards_with_stats(same_dir, include_favorites=True)
@@ -3611,7 +3930,7 @@ def watch_video(filepath):
         duration=duration_disp, file_url=file_url, stream_base=stream_base,
         thumb_url=with_grant(url_for('serve_file', filepath=os.path.relpath(generate_thumbnail(full), VIDEO_ROOT).replace("\\","/")), scope if scope else None),
         current_user=g.user, request_path=request.full_path if request.query_string else request.path,
-        author=current_author, watch_session_id=watch_session_id,
+        author=current_author, author_subscribed=author_subscribed, watch_session_id=watch_session_id,
         video_duration_seconds=video_duration_seconds
     )
     resp.set_data(html)
@@ -3870,18 +4189,23 @@ def api_state():
     resp = make_response()
     get_user_cookie(resp)
     path = request.args.get("path") or ""
+    author_param = normalize_author_name(request.args.get("author"))
     counts = reaction_counts([path]).get(path, {"likes": 0, "dislikes": 0})
     fav = False
     reaction = None
+    author_subscribed = False
     if g.user is not None and path:
         reaction = user_reaction_for(path)
         fav = is_favorite(path)
+    if g.user is not None and author_param:
+        author_subscribed = is_author_subscribed(author_param)
     data = {
         "likes": counts.get("likes", 0),
         "dislikes": counts.get("dislikes", 0),
         "user_reaction": reaction,
         "favorite": fav,
-        "authenticated": g.user is not None
+        "authenticated": g.user is not None,
+        "author_subscribed": author_subscribed
     }
     resp.set_data(json.dumps(data))
     resp.mimetype = "application/json"
@@ -3989,6 +4313,55 @@ def api_unfavorite():
     return jsonify({"ok": True, "favorite": False})
 
 
+@app.route("/api/subscribe_author", methods=["POST"])
+def api_subscribe_author():
+    need = require_auth_api()
+    if need:
+        return need
+    if not allow_rate("subscribe", 30, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+    data = request.get_json(force=True) or {}
+    author = normalize_author_name(data.get("author"))
+    if not author:
+        return jsonify({"ok": False}), 400
+    db = get_db()
+    db.execute(
+        "INSERT INTO author_subscriptions (user_id, author) VALUES (?, ?) "
+        "ON CONFLICT(user_id, author) DO NOTHING",
+        (g.user["id"], author)
+    )
+    db.commit()
+    if hasattr(g, "_author_subscriptions") and isinstance(g._author_subscriptions, set):
+        g._author_subscriptions.add(author)
+    if hasattr(g, "_author_weights"):
+        delattr(g, "_author_weights")
+    return jsonify({"ok": True, "author": author, "subscribed": True})
+
+
+@app.route("/api/unsubscribe_author", methods=["POST"])
+def api_unsubscribe_author():
+    need = require_auth_api()
+    if need:
+        return need
+    if not allow_rate("subscribe", 30, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+    data = request.get_json(force=True) or {}
+    author = normalize_author_name(data.get("author"))
+    if not author:
+        return jsonify({"ok": False}), 400
+    db = get_db()
+    db.execute(
+        "DELETE FROM author_subscriptions WHERE user_id = ? AND author = ?",
+        (g.user["id"], author)
+    )
+    db.commit()
+    if hasattr(g, "_author_subscriptions") and isinstance(g._author_subscriptions, set):
+        g._author_subscriptions.discard(author)
+    if hasattr(g, "_author_weights"):
+        delattr(g, "_author_weights")
+    return jsonify({"ok": True, "author": author, "subscribed": False})
+
+
 @app.route("/api/watch-progress", methods=["POST"])
 def api_watch_progress():
     data = request.get_json(silent=True) or {}
@@ -4070,6 +4443,33 @@ def favorites_page():
     attach_secure_urls(items)
     html = render_template_string(TEMPLATE_FAVORITES, items=items, lang=lang, ui=ui, current_user=g.user)
     return html
+
+
+@app.route("/shorts")
+def shorts_page():
+    lang, ui = get_lang()
+    sort_mode = resolve_sort_mode()
+    sort_options = build_sort_options(ui)
+    entries = list_short_videos(lang)
+    enrich_cards_with_stats(entries, include_favorites=True)
+    apply_sort(entries, sort_mode)
+    entries = entries[:200]
+    attach_secure_urls(entries)
+    for item in entries:
+        scope = get_protected_root_for(item["path"])
+        item["file_url"] = with_grant(url_for('serve_file', filepath=item['path']), scope)
+        if not item.get("thumb_url"):
+            item["thumb_url"] = with_grant(url_for('serve_file', filepath=item['thumb']), scope if scope else None)
+        item["subscribed"] = is_author_subscribed(item.get("author"))
+    return render_template_string(
+        TEMPLATE_SHORTS,
+        shorts=entries,
+        lang=lang,
+        ui=ui,
+        current_user=g.user,
+        sort_mode=sort_mode,
+        sort_options=sort_options,
+    )
 
 
 @app.route("/upload", methods=["GET", "POST"])
