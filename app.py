@@ -119,6 +119,8 @@ COLLAB_CACHE_LOCK = threading.Lock()
 
 # shorts configuration (seconds)
 SHORTS_MAX_DURATION = float(os.environ.get("SHORTS_MAX_DURATION", "120"))
+SHORTS_INITIAL_BATCH = max(int(os.environ.get("SHORTS_INITIAL_BATCH", "12")), 1)
+SHORTS_API_BATCH = max(int(os.environ.get("SHORTS_API_BATCH", "10")), 1)
 
 
 def mark_popular_dirty() -> None:
@@ -837,6 +839,9 @@ UI_TEXT = {
         "author": "Author", "recommendations": "Recommended for you", "upload": "Upload",
         "shorts": "Shorts", "subscribe": "Subscribe", "unsubscribe": "Unsubscribe",
         "subscribed": "Subscribed", "shorts_empty": "No shorts yet",
+        "shorts_hint": "Scroll or swipe for the next short", "next_short": "Next",
+        "prev_short": "Previous", "open_short": "Watch full video",
+        "sound_on": "Sound on", "sound_off": "Sound off",
         "account_stats": "Stats", "admin_panel": "Admin panel", "moderator_panel": "Moderator panel",
         "pending_uploads": "Pending uploads", "approve": "Approve", "reject": "Reject", "notes": "Notes",
         "target_folder": "Target folder", "status_pending": "Pending", "status_approved": "Approved",
@@ -873,6 +878,9 @@ UI_TEXT = {
         "author": "Автор", "recommendations": "Рекомендации", "upload": "Загрузить",
         "shorts": "Шортсы", "subscribe": "Подписаться", "unsubscribe": "Отписаться",
         "subscribed": "Вы подписаны", "shorts_empty": "Нет коротких видео",
+        "shorts_hint": "Листайте колесиком или свайпом для следующего шорта",
+        "next_short": "Далее", "prev_short": "Назад", "open_short": "Смотреть полностью",
+        "sound_on": "Включить звук", "sound_off": "Выключить звук",
         "account_stats": "Статистика", "admin_panel": "Панель админа", "moderator_panel": "Панель модератора",
         "pending_uploads": "Ожидают модерации", "approve": "Одобрить", "reject": "Отклонить",
         "notes": "Комментарий", "target_folder": "Папка назначения", "status_pending": "Ожидает",
@@ -1720,6 +1728,45 @@ def attach_secure_urls(videos: List[Dict]):
         v["preview_url"] = with_grant(url_for('preview_file', filepath=v['path']), sc if sc else None)
 
 
+def hydrate_short_entries(entries: List[Dict]) -> None:
+    if not entries:
+        return
+    attach_secure_urls(entries)
+    for item in entries:
+        scope = get_protected_root_for(item["path"])
+        item["file_url"] = with_grant(url_for('serve_file', filepath=item['path']), scope)
+        if not item.get("thumb_url"):
+            item["thumb_url"] = with_grant(
+                url_for('serve_file', filepath=item['thumb']), scope if scope else None
+            )
+        item["subscribed"] = is_author_subscribed(item.get("author"))
+        item["user_reaction"] = user_reaction_for(item["path"]) if g.user else None
+
+
+def serialize_short_entry(item: Dict) -> Dict:
+    author = item.get("author")
+    normalized_author = normalize_author_name(author)
+    return {
+        "path": item.get("path"),
+        "display": item.get("display"),
+        "author": author,
+        "author_key": (normalized_author.lower() if normalized_author else ""),
+        "duration": item.get("duration"),
+        "duration_seconds": float(item.get("duration_seconds") or 0.0),
+        "views": int(item.get("views", 0) or 0),
+        "likes": int(item.get("likes", 0) or 0),
+        "dislikes": int(item.get("dislikes", 0) or 0),
+        "favorites": int(item.get("favorites", 0) or 0),
+        "watch_url": item.get("watch_url"),
+        "file_url": item.get("file_url"),
+        "thumb_url": item.get("thumb_url"),
+        "preview_url": item.get("preview_url"),
+        "subscribed": bool(item.get("subscribed")),
+        "user_reaction": item.get("user_reaction"),
+        "mtime": item.get("mtime"),
+    }
+
+
 def collect_video_entries(paths: List[str], lang: str) -> List[Dict]:
     refresh_video_index()
     entries: List[Dict] = []
@@ -2508,183 +2555,656 @@ TEMPLATE_SHORTS = """<!doctype html>
 <title>🎞 {{ ui['shorts'] }}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-:root{--bg:#0d1117;--card:#11151b;--text:#e6edf3;--muted:#9aa4b2;--accent:#238636;--accent2:#2ea043;--shadow:0 10px 30px rgba(0,0,0,.35)}
+:root{--bg:#0d1117;--card:#11151b;--text:#e6edf3;--muted:#9aa4b2;--accent:#238636;--accent2:#2ea043;--shadow:0 20px 50px rgba(0,0,0,.45);}
 *{box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:\"Inter\",\"Segoe UI\",Arial,sans-serif;margin:0}
-.container{max-width:960px;margin:auto;padding:20px}
-.header{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center}
-.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-.button{background:var(--accent);color:#fff;border:0;padding:10px 14px;border-radius:12px;text-decoration:none;display:inline-flex;gap:8px;align-items:center;box-shadow:var(--shadow);transition:.25s}
-.button:hover{background:var(--accent2);transform:scale(1.03)}
-.logout-btn{background:#dc3545}
-.logout-btn:hover{background:#ff4757}
-.user-badge{display:inline-flex;align-items:center;gap:6px;padding:10px 12px;border-radius:12px;background:#1c2129;color:var(--text);font-weight:600;box-shadow:var(--shadow)}
-h1{margin:10px 0 16px;font-size:24px;font-weight:800}
-.sort-bar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin:18px 0}
-.sort-select{background:#151b23;border:1px solid #242c37;color:var(--text);padding:8px 12px;border-radius:12px;cursor:pointer;box-shadow:var(--shadow)}
-.shorts{display:flex;flex-direction:column;gap:24px}
-.card{background:var(--card);border-radius:16px;box-shadow:var(--shadow);padding:16px;display:flex;flex-direction:column;gap:12px}
-.short-video{width:100%;border-radius:12px;background:#000;max-height:70vh}
-.stats{display:flex;gap:12px;align-items:center;flex-wrap:wrap;color:var(--muted)}
-.btn{background:#222b35;color:#fff;border:0;padding:8px 12px;border-radius:10px;cursor:pointer;transition:.2s}
-.btn:hover{background:#2a3440}
-.btn.subscribe.active{background:#238636}
-.muted{color:var(--muted)}
-@media(max-width:700px){.container{padding:14px}}
+body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe UI",Arial,sans-serif;overflow:hidden;}
+.hidden{display:none!important}
+.container{max-width:1180px;margin:auto;padding:20px 28px;}
+.header{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;justify-content:space-between;}
+.header h1{margin:0;font-size:26px;font-weight:800;}
+.hint{color:var(--muted);font-size:13px;margin-top:6px;max-width:360px;}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;}
+.button{background:var(--accent);color:#fff;border:0;padding:10px 14px;border-radius:12px;text-decoration:none;display:inline-flex;gap:8px;align-items:center;box-shadow:var(--shadow);transition:.25s;}
+.button:hover{background:var(--accent2);transform:scale(1.03);}
+.logout-btn{background:#dc3545;}
+.logout-btn:hover{background:#ff4757;}
+.user-chip{display:inline-flex;align-items:center;gap:6px;padding:10px 12px;border-radius:12px;background:#1c2129;color:#fff;font-weight:600;box-shadow:var(--shadow);}
+.sort-form{display:flex;align-items:center;gap:8px;}
+.sort-form label{color:var(--muted);font-size:13px;}
+.sort-select{background:#151b23;border:1px solid #242c37;color:var(--text);padding:8px 12px;border-radius:12px;cursor:pointer;box-shadow:var(--shadow);}
+.stage{position:relative;flex:1;display:flex;justify-content:center;align-items:center;margin-top:12px;}
+.short-card{position:relative;width:min(100vw,430px);height:calc(100vh - 210px);max-height:800px;background:#000;border-radius:28px;overflow:hidden;box-shadow:0 28px 60px rgba(0,0,0,.55);}
+.short-video{width:100%;height:100%;object-fit:cover;background:#000;}
+.sound-toggle{position:absolute;top:16px;right:16px;background:rgba(0,0,0,.5);color:#fff;border:0;border-radius:50%;width:48px;height:48px;display:flex;align-items:center;justify-content:center;font-size:20px;cursor:pointer;transition:.2s;}
+.sound-toggle:hover{background:rgba(0,0,0,.7);}
+.sound-toggle.active{background:#238636;}
+.overlay-info{position:absolute;left:18px;bottom:18px;color:#fff;text-shadow:0 2px 10px rgba(0,0,0,.75);display:flex;flex-direction:column;gap:10px;max-width:70%;}
+.overlay-info .title{font-size:19px;font-weight:700;line-height:1.3;}
+.overlay-info .meta{font-size:13px;color:rgba(255,255,255,.85);}
+.overlay-controls{position:absolute;right:18px;bottom:18px;display:flex;flex-direction:column;align-items:center;gap:18px;}
+.overlay-button{background:rgba(0,0,0,.5);color:#fff;border:0;border-radius:22px;padding:12px 14px;min-width:72px;display:flex;flex-direction:column;align-items:center;gap:6px;font-size:13px;font-weight:600;cursor:pointer;transition:.2s;text-decoration:none;}
+.overlay-button:hover{background:rgba(0,0,0,.7);transform:translateY(-2px);}
+.overlay-button.active{background:#238636;}
+.overlay-button .count{font-size:16px;}
+.loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-weight:600;letter-spacing:4px;}
+.empty{color:var(--muted);font-size:16px;text-align:center;}
+.nav-controls{display:flex;justify-content:center;align-items:center;gap:14px;margin:18px 0 28px;}
+.nav-button{background:#222b35;color:#fff;border:0;border-radius:12px;padding:10px 18px;font-size:15px;cursor:pointer;transition:.2s;}
+.nav-button:hover{background:#2a3440;}
+.counter{color:var(--muted);min-width:90px;text-align:center;font-size:14px;}
+@media(max-width:900px){
+  .container{padding:16px 18px;}
+  .toolbar{justify-content:flex-start;}
+  .short-card{width:92vw;height:calc(100vh - 230px);border-radius:24px;}
+  .overlay-controls{right:12px;bottom:14px;}
+  .overlay-info{left:14px;bottom:16px;}
+}
 </style>
 </head>
 <body>
-<div class="container">
-  <div class="header">
+<div class="container header">
+  <div>
     <h1>🎞 {{ ui['shorts'] }}</h1>
-    <div class="toolbar">
-      <a class="button" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
-      <a class="button" href="{{ url_for('random_video') }}">🎲 {{ ui['random'] }}</a>
-      {% if current_user %}
-        <span class="user-badge">👤 {{ current_user['username'] }}</span>
-        <a class="button" href="{{ url_for('upload_video') }}">⬆️ {{ ui['upload'] }}</a>
-        <a class="button" href="{{ url_for('favorites_page') }}">❤️ {{ ui['favorites'] }}</a>
-        <a class="button logout-btn" href="{{ url_for('logout', next=request.full_path if request.query_string else request.path) }}">🚪 {{ ui['logout'] }}</a>
-      {% else %}
-        <a class="button" href="{{ url_for('login', next=request.full_path if request.query_string else request.path) }}">🔑 {{ ui['login'] }}</a>
-        <a class="button" href="{{ url_for('register', next=request.full_path if request.query_string else request.path) }}">🆕 {{ ui['register'] }}</a>
-      {% endif %}
-    </div>
+    <div class="hint">{{ ui['shorts_hint'] }}</div>
   </div>
-
-  <div class="sort-bar">
-    <div>{{ ui['sort_by'] }}:</div>
-    <form method="get" action="{{ url_for('shorts_page') }}">
-      <select class="sort-select" name="sort" onchange="this.form.submit()">
+  <div class="toolbar">
+    <a class="button" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
+    <a class="button" href="{{ url_for('random_video') }}">🎲 {{ ui['random'] }}</a>
+    {% if current_user %}
+      <span class="user-chip">👤 {{ current_user['username'] }}</span>
+      <a class="button" href="{{ url_for('favorites_page') }}">❤️ {{ ui['favorites'] }}</a>
+      <a class="button logout-btn" href="{{ url_for('logout', next=request.full_path if request.query_string else request.path) }}">🚪 {{ ui['logout'] }}</a>
+    {% else %}
+      <a class="button" href="{{ url_for('login', next=request.full_path if request.query_string else request.path) }}">🔑 {{ ui['login'] }}</a>
+      <a class="button" href="{{ url_for('register', next=request.full_path if request.query_string else request.path) }}">🆕 {{ ui['register'] }}</a>
+    {% endif %}
+    <form class="sort-form" method="get" action="{{ url_for('shorts_page') }}">
+      <label for="shortSort">{{ ui['sort_by'] }}</label>
+      <select id="shortSort" name="sort" class="sort-select" onchange="this.form.submit()">
         {% for key, label in sort_options %}
           <option value="{{ key }}" {% if sort_mode == key %}selected{% endif %}>{{ label }}</option>
         {% endfor %}
       </select>
     </form>
   </div>
-
-  <div class="shorts" id="shorts-list">
-    {% if shorts %}
-      {% for item in shorts %}
-        <div class="card" data-path="{{ item['path'] }}" data-author="{{ item.get('author') or '' }}">
-          <video class="short-video" playsinline webkit-playsinline muted loop preload="none" poster="{{ item['thumb_url'] }}" data-src="{{ item['file_url'] }}" controls></video>
-          <div class="stats">
-            <span>👁 {{ item.get('views', 0) }}</span>
-            <span>👍 <span class="like-count">{{ item.get('likes', 0) }}</span></span>
-            <span>⏱ {{ item['duration'] }}</span>
-            <span>👤 {{ item.get('author') or '—' }}</span>
-          </div>
-          <div class="stats">
-            <button class="btn like-btn">👍 {{ ui['like'] }}</button>
-            {% if item.get('author') %}
-              <button class="btn subscribe {% if item.get('subscribed') %}active{% endif %}">
-                {% if item.get('subscribed') %}{{ ui['subscribed'] }}{% else %}{{ ui['subscribe'] }}{% endif %}
-              </button>
-            {% endif %}
-            <a class="button" href="{{ item['watch_url'] }}">▶️ {{ ui['videos'] }}</a>
-          </div>
-        </div>
-      {% endfor %}
-    {% else %}
-      <p class="muted">{{ ui['shorts_empty'] }}</p>
-    {% endif %}
+</div>
+<div class="stage" id="shortStage">
+  <div id="shortCard" class="short-card hidden">
+    <video id="shortPlayer" class="short-video" playsinline webkit-playsinline loop muted preload="none" controlslist="nodownload noplaybackrate noremoteplayback"></video>
+    <button id="soundToggle" class="sound-toggle" title="{{ ui['sound_on'] }}">🔇</button>
+    <div class="overlay-info">
+      <div class="title" id="shortTitle"></div>
+      <div class="meta" id="shortMeta"></div>
+    </div>
+    <div class="overlay-controls">
+      <button id="likeButton" class="overlay-button" type="button">
+        <span>👍 {{ ui['like'] }}</span>
+        <span class="count" id="likeCount">0</span>
+      </button>
+      <button id="subscribeButton" class="overlay-button hidden" type="button">
+        <span id="subscribeLabel">{{ ui['subscribe'] }}</span>
+        <span class="count" id="subscribeAuthor">—</span>
+      </button>
+      <a id="openButton" class="overlay-button" href="#" target="_blank" rel="noopener">
+        <span>▶️</span>
+        <span>{{ ui['open_short'] }}</span>
+      </a>
+    </div>
+    <div id="shortLoading" class="loading hidden">•••</div>
   </div>
+  <div id="shortEmpty" class="empty hidden">{{ ui['shorts_empty'] }}</div>
+</div>
+<div class="nav-controls">
+  <button id="prevShort" class="nav-button" type="button" title="{{ ui['prev_short'] }}">⬆️ {{ ui['prev_short'] }}</button>
+  <div class="counter" id="shortCounter">0 / 0</div>
+  <button id="nextShort" class="nav-button" type="button" title="{{ ui['next_short'] }}">{{ ui['next_short'] }} ⬇️</button>
 </div>
 <script>
 (function(){
-  const isAuth={{ 'true' if current_user else 'false' }};
-  const loginUrl={{ url_for('login', next=request.full_path if request.query_string else request.path)|tojson }};
-  const likeUrl={{ url_for('api_like')|tojson }};
-  const subscribeUrl={{ url_for('api_subscribe_author')|tojson }};
-  const unsubscribeUrl={{ url_for('api_unsubscribe_author')|tojson }};
+  const isAuth = {{ 'true' if current_user else 'false' }};
+  const loginUrl = {{ url_for('login', next=request.full_path if request.query_string else request.path)|tojson }};
+  const registerUrl = {{ url_for('register', next=request.full_path if request.query_string else request.path)|tojson }};
+  const stateUrl = {{ url_for('api_state')|tojson }};
+  const likeUrl = {{ url_for('api_like')|tojson }};
+  const subscribeUrl = {{ url_for('api_subscribe_author')|tojson }};
+  const unsubscribeUrl = {{ url_for('api_unsubscribe_author')|tojson }};
+  const feedUrl = {{ url_for('api_shorts_feed')|tojson }};
+  const viewUrl = {{ url_for('api_short_view')|tojson }};
+  const sortMode = {{ sort_mode|tojson }};
+  const batchSize = {{ shorts_batch }};
+  let total = {{ total_shorts }};
+  const strings = {
+    subscribe: {{ ui['subscribe']|tojson }},
+    subscribed: {{ ui['subscribed']|tojson }},
+    unsubscribe: {{ ui['unsubscribe']|tojson }},
+    soundOn: {{ ui['sound_on']|tojson }},
+    soundOff: {{ ui['sound_off']|tojson }}
+  };
+  const initialData = {{ initial_shorts|tojson }};
+  let feed = Array.isArray(initialData) ? initialData.slice() : [];
+  let index = 0;
+  let soundEnabled = false;
+  let loadingMore = false;
+  let userPaused = false;
+  let viewTimeout = null;
+  let lastNav = 0;
+  const preloaded = new Map();
+  const stateCache = new Map();
+  const viewedPaths = new Set();
 
-  function ensureSource(video){
-    if(!video.src){
-      video.src=video.dataset.src;
+  const stage = document.getElementById('shortStage');
+  const card = document.getElementById('shortCard');
+  const empty = document.getElementById('shortEmpty');
+  const player = document.getElementById('shortPlayer');
+  const loading = document.getElementById('shortLoading');
+  const titleEl = document.getElementById('shortTitle');
+  const metaEl = document.getElementById('shortMeta');
+  const likeBtn = document.getElementById('likeButton');
+  const likeCountEl = document.getElementById('likeCount');
+  const subscribeBtn = document.getElementById('subscribeButton');
+  const subscribeLabel = document.getElementById('subscribeLabel');
+  const subscribeAuthorEl = document.getElementById('subscribeAuthor');
+  const openBtn = document.getElementById('openButton');
+  const prevBtn = document.getElementById('prevShort');
+  const nextBtn = document.getElementById('nextShort');
+  const counterEl = document.getElementById('shortCounter');
+  const soundToggle = document.getElementById('soundToggle');
+
+  function clampIndex(){
+    if(!feed.length){
+      index = 0;
+      return;
+    }
+    if(index < 0){ index = 0; }
+    if(index >= feed.length){ index = feed.length - 1; }
+  }
+
+  function currentItem(){
+    if(!feed.length){
+      return null;
+    }
+    clampIndex();
+    return feed[index] || null;
+  }
+
+  function formatCount(val){
+    const num = Number(val) || 0;
+    const abs = Math.abs(num);
+    if(abs >= 1e6){
+      const scaled = (num / 1e6).toFixed(abs >= 1e7 ? 0 : 1);
+      return scaled.replace(/\.0$/, '') + 'M';
+    }
+    if(abs >= 1e3){
+      const scaled = (num / 1e3).toFixed(abs >= 1e4 ? 0 : 1);
+      return scaled.replace(/\.0$/, '') + 'K';
+    }
+    return String(num);
+  }
+
+  function buildMeta(item){
+    if(!item){
+      return '';
+    }
+    const parts = [];
+    if(item.author){
+      parts.push('👤 ' + item.author);
+    }
+    const viewsVal = typeof item.views === 'number' ? item.views : Number(item.views) || 0;
+    parts.push('👁 ' + formatCount(viewsVal));
+    if(item.duration){
+      parts.push('⏱ ' + item.duration);
+    }
+    return parts.join(' • ');
+  }
+
+  function updateCounter(){
+    const totalDisplay = Math.max(total || 0, feed.length || 0);
+    if(!feed.length){
+      counterEl.textContent = '0 / ' + totalDisplay;
+    } else {
+      counterEl.textContent = (index + 1) + ' / ' + totalDisplay;
     }
   }
 
-  document.querySelectorAll('.short-video').forEach(video=>{
-    video.addEventListener('play',()=>ensureSource(video),{once:true});
-    video.addEventListener('click',()=>{
-      ensureSource(video);
-      video.play().catch(()=>{});
-    });
-  });
-
-  async function postReaction(path){
-    const res=await fetch(likeUrl,{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({path})
-    });
-    if(res.status===401){
-      window.location=loginUrl;
-      return null;
-    }
-    if(!res.ok){
-      return null;
-    }
-    return res.json();
+  function showLoading(flag){
+    loading.classList.toggle('hidden', !flag);
   }
 
-  async function toggleSubscription(author, subscribe){
-    const target=subscribe?subscribeUrl:unsubscribeUrl;
-    const res=await fetch(target,{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({author})
-    });
-    if(res.status===401){
-      window.location=loginUrl;
-      return null;
+  function updateLikeState(item){
+    likeCountEl.textContent = formatCount(item && item.likes !== undefined ? item.likes : 0);
+    if(item && item.user_reaction === 'like'){
+      likeBtn.classList.add('active');
+    } else {
+      likeBtn.classList.remove('active');
     }
-    if(!res.ok){
-      return null;
-    }
-    return res.json();
   }
 
-  document.querySelectorAll('.card').forEach(card=>{
-    const path=card.dataset.path;
-    const author=(card.dataset.author||'').trim();
-    const likeBtn=card.querySelector('.like-btn');
-    const likeCountEl=card.querySelector('.like-count');
-    const subscribeBtn=card.querySelector('.subscribe');
+  function updateSoundUI(){
+    if(soundEnabled){
+      soundToggle.classList.add('active');
+      soundToggle.textContent = '🔊';
+      soundToggle.title = strings.soundOff;
+      player.muted = false;
+    } else {
+      soundToggle.classList.remove('active');
+      soundToggle.textContent = '🔇';
+      soundToggle.title = strings.soundOn;
+      player.muted = true;
+    }
+  }
 
-    if(likeBtn){
-      likeBtn.addEventListener('click',async()=>{
-        if(!isAuth){
-          window.location=loginUrl;
-          return;
+  function updateSubscribeButton(item){
+    if(!item || !item.author){
+      subscribeBtn.classList.add('hidden');
+      return;
+    }
+    subscribeBtn.classList.remove('hidden');
+    subscribeAuthorEl.textContent = '@' + item.author;
+    if(item.subscribed){
+      subscribeBtn.classList.add('active');
+      subscribeLabel.textContent = strings.subscribed;
+      subscribeBtn.title = strings.unsubscribe;
+    } else {
+      subscribeBtn.classList.remove('active');
+      subscribeLabel.textContent = strings.subscribe;
+      subscribeBtn.title = strings.subscribe;
+    }
+  }
+
+  function render(){
+    const item = currentItem();
+    if(!item){
+      card.classList.add('hidden');
+      empty.classList.remove('hidden');
+      updateCounter();
+      return;
+    }
+    empty.classList.add('hidden');
+    card.classList.remove('hidden');
+    showLoading(true);
+    userPaused = false;
+    if(viewTimeout){
+      clearTimeout(viewTimeout);
+      viewTimeout = null;
+    }
+    player.pause();
+    player.removeAttribute('src');
+    player.load();
+    player.poster = item.thumb_url || '';
+    titleEl.textContent = item.display || item.name || '';
+    metaEl.textContent = buildMeta(item);
+    openBtn.href = item.watch_url || '#';
+    updateLikeState(item);
+    updateSubscribeButton(item);
+    updateSoundUI();
+    updateCounter();
+    requestAnimationFrame(()=>{
+      if(item.file_url){
+        player.src = item.file_url;
+        player.play().catch(()=>{ showLoading(false); });
+      } else {
+        showLoading(false);
+      }
+    });
+    fetchState(item);
+    scheduleView(item);
+    prefetchAround();
+    ensureMore();
+  }
+
+  function prefetchAround(){
+    prefetch(index + 1);
+    prefetch(index + 2);
+  }
+
+  function prefetch(targetIndex){
+    if(targetIndex < 0 || targetIndex >= feed.length){
+      return;
+    }
+    const item = feed[targetIndex];
+    if(!item || !item.file_url || preloaded.has(item.path)){
+      return;
+    }
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.src = item.file_url;
+    preloaded.set(item.path, video);
+    if(preloaded.size > 36){
+      const first = preloaded.keys().next();
+      if(!first.done){
+        preloaded.delete(first.value);
+      }
+    }
+  }
+
+  function ensureMore(){
+    if(loadingMore || feed.length >= total){
+      return;
+    }
+    if(index >= feed.length - 3){
+      fetchMore();
+    }
+  }
+
+  async function fetchMore(){
+    if(loadingMore){
+      return;
+    }
+    loadingMore = true;
+    try{
+      const params = new URLSearchParams();
+      params.set('offset', String(feed.length));
+      params.set('sort', sortMode || 'name');
+      params.set('limit', String(batchSize));
+      const res = await fetch(feedUrl + '?' + params.toString());
+      if(!res.ok){
+        return;
+      }
+      const data = await res.json();
+      if(data && typeof data.total === 'number'){
+        total = data.total;
+      }
+      if(data && Array.isArray(data.items) && data.items.length){
+        data.items.forEach(item => feed.push(item));
+        updateCounter();
+        prefetchAround();
+      }
+    } catch(err){
+      console.error(err);
+    } finally {
+      loadingMore = false;
+    }
+  }
+
+  function scheduleView(item){
+    if(!item){
+      return;
+    }
+    if(viewTimeout){
+      clearTimeout(viewTimeout);
+      viewTimeout = null;
+    }
+    if(viewedPaths.has(item.path)){
+      return;
+    }
+    viewTimeout = setTimeout(()=>registerView(item), 2000);
+  }
+
+  async function registerView(item){
+    if(!item || viewedPaths.has(item.path)){
+      return;
+    }
+    viewedPaths.add(item.path);
+    try{
+      const res = await fetch(viewUrl, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({path:item.path})
+      });
+      if(!res.ok){
+        return;
+      }
+      const data = await res.json();
+      if(data && typeof data.views === 'number'){
+        item.views = data.views;
+        const current = currentItem();
+        if(current && current.path === item.path){
+          metaEl.textContent = buildMeta(item);
         }
-        const data=await postReaction(path);
-        if(data && likeCountEl){
-          likeCountEl.textContent=data.likes;
+      }
+    } catch(err){
+      console.error(err);
+    }
+  }
+
+  async function fetchState(item){
+    if(!item || stateCache.has(item.path)){
+      return;
+    }
+    stateCache.set(item.path, true);
+    try{
+      const res = await fetch(stateUrl + '?path=' + encodeURIComponent(item.path));
+      if(!res.ok){
+        return;
+      }
+      const data = await res.json();
+      if(data){
+        if(typeof data.likes === 'number'){
+          item.likes = data.likes;
+        }
+        if(typeof data.dislikes === 'number'){
+          item.dislikes = data.dislikes;
+        }
+        if(data.user_reaction !== undefined){
+          item.user_reaction = data.user_reaction;
+        }
+        if(data.favorite !== undefined){
+          item.favorite = data.favorite;
+        }
+        updateLikeState(item);
+      }
+    } catch(err){
+      console.error(err);
+    }
+  }
+
+  async function toggleLike(){
+    const item = currentItem();
+    if(!item){
+      return;
+    }
+    if(!isAuth){
+      window.location = loginUrl;
+      return;
+    }
+    try{
+      const res = await fetch(likeUrl, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({path:item.path})
+      });
+      if(res.status === 401){
+        window.location = loginUrl;
+        return;
+      }
+      if(!res.ok){
+        return;
+      }
+      const data = await res.json();
+      if(data){
+        if(typeof data.likes === 'number'){
+          item.likes = data.likes;
+        }
+        if(data.user_reaction !== undefined){
+          item.user_reaction = data.user_reaction;
+        }
+        updateLikeState(item);
+      }
+    } catch(err){
+      console.error(err);
+    }
+  }
+
+  async function toggleSubscription(){
+    const item = currentItem();
+    if(!item || !item.author){
+      return;
+    }
+    if(!isAuth){
+      window.location = registerUrl;
+      return;
+    }
+    const shouldSubscribe = !item.subscribed;
+    const target = shouldSubscribe ? subscribeUrl : unsubscribeUrl;
+    try{
+      const res = await fetch(target, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({author:item.author})
+      });
+      if(res.status === 401){
+        window.location = loginUrl;
+        return;
+      }
+      if(!res.ok){
+        return;
+      }
+      const data = await res.json();
+      if(data && typeof data.subscribed === 'boolean'){
+        updateSubscriptionForAuthor(item.author_key, data.subscribed);
+        updateSubscribeButton(currentItem());
+      }
+    } catch(err){
+      console.error(err);
+    }
+  }
+
+  function updateSubscriptionForAuthor(key, subscribed){
+    if(!key){
+      return;
+    }
+    feed.forEach(entry => {
+      if(entry.author_key === key){
+        entry.subscribed = subscribed;
+      }
+    });
+  }
+
+  function gotoNext(){
+    if(!feed.length){
+      return;
+    }
+    if(index < feed.length - 1){
+      index += 1;
+      render();
+    } else if(feed.length < total){
+      fetchMore().then(()=>{
+        if(index < feed.length - 1){
+          index += 1;
+          render();
+        } else {
+          updateCounter();
         }
       });
     }
+  }
 
-    if(subscribeBtn && author){
-      subscribeBtn.addEventListener('click',async()=>{
-        if(!isAuth){
-          window.location=loginUrl;
-          return;
-        }
-        const subscribing=!subscribeBtn.classList.contains('active');
-        const data=await toggleSubscription(author, subscribing);
-        if(data){
-          if(subscribing){
-            subscribeBtn.classList.add('active');
-            subscribeBtn.textContent={{ ui['subscribed']|tojson }};
-          }else{
-            subscribeBtn.classList.remove('active');
-            subscribeBtn.textContent={{ ui['subscribe']|tojson }};
-          }
-        }
-      });
+  function gotoPrev(){
+    if(!feed.length){
+      return;
+    }
+    if(index > 0){
+      index -= 1;
+      render();
+    }
+  }
+
+  function handleNavigate(direction){
+    const now = Date.now();
+    if(now - lastNav < 250){
+      return;
+    }
+    lastNav = now;
+    if(direction > 0){
+      gotoNext();
+    } else {
+      gotoPrev();
+    }
+  }
+
+  likeBtn.addEventListener('click', toggleLike);
+  subscribeBtn.addEventListener('click', toggleSubscription);
+  prevBtn.addEventListener('click', ()=>handleNavigate(-1));
+  nextBtn.addEventListener('click', ()=>handleNavigate(1));
+  soundToggle.addEventListener('click', ()=>{
+    soundEnabled = !soundEnabled;
+    updateSoundUI();
+    if(!player.paused && player.readyState >= 2){
+      player.play().catch(()=>{});
     }
   });
+
+  player.addEventListener('click', ()=>{
+    if(player.paused){
+      userPaused = false;
+      player.play().catch(()=>{});
+    } else {
+      userPaused = true;
+      player.pause();
+    }
+  });
+
+  player.addEventListener('waiting', ()=>showLoading(true));
+  player.addEventListener('playing', ()=>showLoading(false));
+  player.addEventListener('loadeddata', ()=>showLoading(false));
+  player.addEventListener('pause', ()=>{
+    if(!userPaused){
+      showLoading(false);
+    }
+  });
+
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.hidden){
+      player.pause();
+    } else if(!userPaused){
+      player.play().catch(()=>{});
+    }
+  });
+
+  window.addEventListener('wheel', (event)=>{
+    event.preventDefault();
+    if(Math.abs(event.deltaY) < 40){
+      return;
+    }
+    handleNavigate(event.deltaY > 0 ? 1 : -1);
+  }, {passive:false});
+
+  window.addEventListener('keydown', (event)=>{
+    if(event.key === 'ArrowDown' || event.key === 'PageDown'){
+      event.preventDefault();
+      handleNavigate(1);
+    } else if(event.key === 'ArrowUp' || event.key === 'PageUp'){
+      event.preventDefault();
+      handleNavigate(-1);
+    } else if(event.key === ' '){
+      event.preventDefault();
+      if(player.paused){
+        userPaused = false;
+        player.play().catch(()=>{});
+      } else {
+        userPaused = true;
+        player.pause();
+      }
+    }
+  });
+
+  let touchStartY = null;
+  stage.addEventListener('touchstart', (event)=>{
+    if(event.touches && event.touches.length === 1){
+      touchStartY = event.touches[0].clientY;
+    }
+  }, {passive:true});
+
+  stage.addEventListener('touchmove', (event)=>{
+    if(touchStartY !== null){
+      event.preventDefault();
+    }
+  }, {passive:false});
+
+  stage.addEventListener('touchend', (event)=>{
+    if(touchStartY === null){
+      return;
+    }
+    const endY = event.changedTouches && event.changedTouches.length ? event.changedTouches[0].clientY : touchStartY;
+    const delta = endY - touchStartY;
+    touchStartY = null;
+    if(Math.abs(delta) < 60){
+      return;
+    }
+    handleNavigate(delta < 0 ? 1 : -1);
+  });
+
+  render();
 })();
 </script>
 </body>
@@ -4313,6 +4833,49 @@ def api_unfavorite():
     return jsonify({"ok": True, "favorite": False})
 
 
+@app.route("/api/shorts_feed")
+def api_shorts_feed():
+    lang, _ = get_lang()
+    sort_mode = resolve_sort_mode()
+    offset = request.args.get("offset", default=0, type=int) or 0
+    limit = request.args.get("limit", default=SHORTS_API_BATCH, type=int) or SHORTS_API_BATCH
+    if offset < 0:
+        offset = 0
+    limit = max(1, min(limit, 100))
+    entries = list_short_videos(lang)
+    enrich_cards_with_stats(entries, include_favorites=True)
+    apply_sort(entries, sort_mode)
+    total_count = len(entries)
+    slice_entries = entries[offset:offset + limit]
+    hydrate_short_entries(slice_entries)
+    payload = [serialize_short_entry(item) for item in slice_entries]
+    resp = jsonify({"items": payload, "total": total_count})
+    get_user_cookie(resp)
+    return resp
+
+
+@app.route("/api/shorts/view", methods=["POST"])
+def api_short_view():
+    data = request.get_json(silent=True) or {}
+    raw_path = data.get("path") or ""
+    path = normalize_rel_path(raw_path)
+    if not path:
+        return jsonify({"ok": False}), 400
+    refresh_video_index()
+    if path not in VIDEO_INDEX:
+        refresh_video_index(force=True)
+    if path not in VIDEO_INDEX:
+        return jsonify({"ok": False}), 404
+    resp = make_response()
+    if register_view_if_new(path, resp):
+        _views[path] = _views.get(path, 0) + 1
+        save_views()
+        mark_popular_dirty()
+    resp.set_data(json.dumps({"ok": True, "views": _views.get(path, 0)}))
+    resp.mimetype = "application/json"
+    return resp
+
+
 @app.route("/api/subscribe_author", methods=["POST"])
 def api_subscribe_author():
     need = require_auth_api()
@@ -4453,22 +5016,20 @@ def shorts_page():
     entries = list_short_videos(lang)
     enrich_cards_with_stats(entries, include_favorites=True)
     apply_sort(entries, sort_mode)
-    entries = entries[:200]
-    attach_secure_urls(entries)
-    for item in entries:
-        scope = get_protected_root_for(item["path"])
-        item["file_url"] = with_grant(url_for('serve_file', filepath=item['path']), scope)
-        if not item.get("thumb_url"):
-            item["thumb_url"] = with_grant(url_for('serve_file', filepath=item['thumb']), scope if scope else None)
-        item["subscribed"] = is_author_subscribed(item.get("author"))
+    total_count = len(entries)
+    initial_entries = entries[:SHORTS_INITIAL_BATCH]
+    hydrate_short_entries(initial_entries)
+    serialized = [serialize_short_entry(item) for item in initial_entries]
     return render_template_string(
         TEMPLATE_SHORTS,
-        shorts=entries,
         lang=lang,
         ui=ui,
         current_user=g.user,
         sort_mode=sort_mode,
         sort_options=sort_options,
+        initial_shorts=serialized,
+        total_shorts=total_count,
+        shorts_batch=SHORTS_API_BATCH,
     )
 
 
