@@ -118,7 +118,7 @@ COLLAB_CACHE_MAX = 800
 COLLAB_CACHE_LOCK = threading.Lock()
 
 # shorts configuration (seconds)
-SHORTS_MAX_DURATION = float(os.environ.get("SHORTS_MAX_DURATION", "120"))
+SHORTS_MAX_DURATION = float(os.environ.get("SHORTS_MAX_DURATION", "0"))
 SHORTS_INITIAL_BATCH = max(int(os.environ.get("SHORTS_INITIAL_BATCH", "12")), 1)
 SHORTS_API_BATCH = max(int(os.environ.get("SHORTS_API_BATCH", "10")), 1)
 
@@ -839,7 +839,7 @@ UI_TEXT = {
         "author": "Author", "recommendations": "Recommended for you", "upload": "Upload",
         "shorts": "Shorts", "subscribe": "Subscribe", "unsubscribe": "Unsubscribe",
         "subscribed": "Subscribed", "shorts_empty": "No shorts yet",
-        "shorts_hint": "Scroll or swipe for the next short", "next_short": "Next",
+        "shorts_hint": "Scroll down or swipe to move between shorts", "next_short": "Next",
         "prev_short": "Previous", "open_short": "Watch full video",
         "sound_on": "Sound on", "sound_off": "Sound off",
         "account_stats": "Stats", "admin_panel": "Admin panel", "moderator_panel": "Moderator panel",
@@ -878,7 +878,7 @@ UI_TEXT = {
         "author": "Автор", "recommendations": "Рекомендации", "upload": "Загрузить",
         "shorts": "Шортсы", "subscribe": "Подписаться", "unsubscribe": "Отписаться",
         "subscribed": "Вы подписаны", "shorts_empty": "Нет коротких видео",
-        "shorts_hint": "Листайте колесиком или свайпом для следующего шорта",
+        "shorts_hint": "Листайте вниз колесиком или свайпом, чтобы переключать шорты",
         "next_short": "Далее", "prev_short": "Назад", "open_short": "Смотреть полностью",
         "sound_on": "Включить звук", "sound_off": "Выключить звук",
         "account_stats": "Статистика", "admin_panel": "Панель админа", "moderator_panel": "Панель модератора",
@@ -1109,6 +1109,20 @@ def with_grant(url: str, scope: Optional[str]) -> str:
     sig = mk_access_signature(scope, exp)
     delim = "&" if ("?" in url) else "?"
     return f"{url}{delim}exp={exp}&sig={sig}"
+
+
+def has_video_access(path: str) -> bool:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return False
+    scope = get_protected_root_for(normalized)
+    if scope is None:
+        return True
+    if not has_app_context():
+        return True
+    if is_admin_request() or is_moderator_request():
+        return True
+    return user_has_persistent_access(scope)
 
 
 def is_admin_request(req=None) -> bool:
@@ -1712,9 +1726,15 @@ def list_all_videos(lang: str) -> List[Dict]:
 def list_short_videos(lang: str) -> List[Dict]:
     refresh_video_index()
     shorts: List[Dict] = []
+    max_duration = SHORTS_MAX_DURATION if SHORTS_MAX_DURATION > 0 else None
     for base in list(VIDEO_INDEX.values()):
+        path = base.get("path") or ""
+        if path and not has_video_access(path):
+            continue
         duration_seconds = float(base.get("duration_seconds") or 0.0)
-        if duration_seconds <= 0.0 or duration_seconds > SHORTS_MAX_DURATION:
+        if duration_seconds <= 0.0:
+            continue
+        if max_duration is not None and duration_seconds > max_duration:
             continue
         shorts.append(localized_video_entry(base, lang))
     return shorts
@@ -1774,6 +1794,8 @@ def collect_video_entries(paths: List[str], lang: str) -> List[Dict]:
         base = VIDEO_INDEX.get(path)
         if not base:
             continue
+        if not has_video_access(path):
+            continue
         entries.append(localized_video_entry(base, lang))
     return entries
 
@@ -1791,6 +1813,8 @@ def build_recommendation_pool(current_path: str, lang: str, current_author: Opti
         if not normalized or normalized == current_path or normalized in seen:
             return
         if normalized not in VIDEO_INDEX:
+            return
+        if not has_video_access(normalized):
             return
         if not allow_same_dir and current_dir_prefix and normalized.startswith(current_dir_prefix):
             strongest_signal = max(
@@ -2572,8 +2596,10 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
 .sort-form{display:flex;align-items:center;gap:8px;}
 .sort-form label{color:var(--muted);font-size:13px;}
 .sort-select{background:#151b23;border:1px solid #242c37;color:var(--text);padding:8px 12px;border-radius:12px;cursor:pointer;box-shadow:var(--shadow);}
-.stage{position:relative;flex:1;display:flex;justify-content:center;align-items:center;margin-top:12px;}
-.short-card{position:relative;width:min(100vw,430px);height:calc(100vh - 210px);max-height:800px;background:#000;border-radius:28px;overflow:hidden;box-shadow:0 28px 60px rgba(0,0,0,.55);}
+.stage{position:relative;width:min(100vw,430px);height:clamp(420px, calc(100vh - 220px), 820px);margin:12px auto 0;overflow-y:auto;scroll-snap-type:y mandatory;overscroll-behavior:contain;-ms-overflow-style:none;scrollbar-width:none;}
+.stage::-webkit-scrollbar{display:none;}
+.scroll-filler{width:100%;height:0;pointer-events:none;}
+.short-card{position:sticky;top:0;width:100%;height:100%;background:#000;border-radius:28px;overflow:hidden;box-shadow:0 28px 60px rgba(0,0,0,.55);}
 .short-video{width:100%;height:100%;object-fit:cover;background:#000;}
 .sound-toggle{position:absolute;top:16px;right:16px;background:rgba(0,0,0,.5);color:#fff;border:0;border-radius:50%;width:48px;height:48px;display:flex;align-items:center;justify-content:center;font-size:20px;cursor:pointer;transition:.2s;}
 .sound-toggle:hover{background:rgba(0,0,0,.7);}
@@ -2588,14 +2614,16 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
 .overlay-button .count{font-size:16px;}
 .loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-weight:600;letter-spacing:4px;}
 .empty{color:var(--muted);font-size:16px;text-align:center;}
-.nav-controls{display:flex;justify-content:center;align-items:center;gap:14px;margin:18px 0 28px;}
+.stage .empty{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:100%;pointer-events:none;}
+.nav-controls{display:flex;justify-content:center;align-items:center;gap:14px;margin:18px auto 28px;width:min(100vw,430px);}
 .nav-button{background:#222b35;color:#fff;border:0;border-radius:12px;padding:10px 18px;font-size:15px;cursor:pointer;transition:.2s;}
 .nav-button:hover{background:#2a3440;}
 .counter{color:var(--muted);min-width:90px;text-align:center;font-size:14px;}
 @media(max-width:900px){
   .container{padding:16px 18px;}
   .toolbar{justify-content:flex-start;}
-  .short-card{width:92vw;height:calc(100vh - 230px);border-radius:24px;}
+  .stage{width:94vw;height:clamp(360px, calc(100vh - 240px), 820px);}
+  .short-card{border-radius:24px;}
   .overlay-controls{right:12px;bottom:14px;}
   .overlay-info{left:14px;bottom:16px;}
 }
@@ -2653,6 +2681,7 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
     <div id="shortLoading" class="loading hidden">•••</div>
   </div>
   <div id="shortEmpty" class="empty hidden">{{ ui['shorts_empty'] }}</div>
+  <div id="scrollFiller" class="scroll-filler"></div>
 </div>
 <div class="nav-controls">
   <button id="prevShort" class="nav-button" type="button" title="{{ ui['prev_short'] }}">⬆️ {{ ui['prev_short'] }}</button>
@@ -2688,11 +2717,14 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
   let userPaused = false;
   let viewTimeout = null;
   let lastNav = 0;
+  let scrollLock = false;
+  let scrollSnapTimer = null;
   const preloaded = new Map();
   const stateCache = new Map();
   const viewedPaths = new Set();
 
   const stage = document.getElementById('shortStage');
+  const scrollFiller = document.getElementById('scrollFiller');
   const card = document.getElementById('shortCard');
   const empty = document.getElementById('shortEmpty');
   const player = document.getElementById('shortPlayer');
@@ -2710,13 +2742,78 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
   const counterEl = document.getElementById('shortCounter');
   const soundToggle = document.getElementById('soundToggle');
 
-  function clampIndex(){
+  function clampIndexValue(value){
     if(!feed.length){
-      index = 0;
+      return 0;
+    }
+    if(value < 0){ return 0; }
+    if(value >= feed.length){ return feed.length - 1; }
+    return value;
+  }
+
+  function clampIndex(){
+    index = clampIndexValue(index);
+  }
+
+  function stageHeight(){
+    return stage.getBoundingClientRect().height || stage.clientHeight || window.innerHeight || 1;
+  }
+
+  function updateScrollFiller(){
+    const height = stageHeight();
+    if(!height){
+      scrollFiller.style.height = '0px';
       return;
     }
-    if(index < 0){ index = 0; }
-    if(index >= feed.length){ index = feed.length - 1; }
+    const count = Math.max(feed.length, 1);
+    const fillerHeight = Math.max(count - 1, 0) * height;
+    scrollFiller.style.height = fillerHeight + 'px';
+  }
+
+  function scrollToCurrent(immediate){
+    if(scrollSnapTimer){
+      clearTimeout(scrollSnapTimer);
+      scrollSnapTimer = null;
+    }
+    if(!feed.length){
+      scrollLock = false;
+      return;
+    }
+    const height = stageHeight();
+    if(!height){
+      return;
+    }
+    const top = index * height;
+    scrollLock = true;
+    if(typeof stage.scrollTo === 'function'){
+      stage.scrollTo({top, behavior: immediate ? 'auto' : 'smooth'});
+      if(immediate){
+        scrollLock = false;
+      }else{
+        setTimeout(()=>{scrollLock = false;}, 320);
+      }
+    }else{
+      stage.scrollTop = top;
+      scrollLock = false;
+    }
+  }
+
+  function setIndex(target, options){
+    options = options || {};
+    if(!feed.length){
+      index = 0;
+      render();
+      return;
+    }
+    const clamped = clampIndexValue(target);
+    const changed = clamped !== index;
+    index = clamped;
+    if(changed || options.force){
+      render();
+    }
+    if(options.scroll){
+      scrollToCurrent(Boolean(options.immediate));
+    }
   }
 
   function currentItem(){
@@ -2812,6 +2909,7 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
   }
 
   function render(){
+    updateScrollFiller();
     const item = currentItem();
     if(!item){
       card.classList.add('hidden');
@@ -2908,6 +3006,7 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
         data.items.forEach(item => feed.push(item));
         updateCounter();
         prefetchAround();
+        updateScrollFiller();
       }
     } catch(err){
       console.error(err);
@@ -2963,7 +3062,12 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
     }
     stateCache.set(item.path, true);
     try{
-      const res = await fetch(stateUrl + '?path=' + encodeURIComponent(item.path));
+      const params = new URLSearchParams();
+      params.set('path', item.path);
+      if(item.author){
+        params.set('author', item.author);
+      }
+      const res = await fetch(stateUrl + '?' + params.toString());
       if(!res.ok){
         return;
       }
@@ -2980,6 +3084,10 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
         }
         if(data.favorite !== undefined){
           item.favorite = data.favorite;
+        }
+        if(typeof data.author_subscribed === 'boolean'){
+          item.subscribed = data.author_subscribed;
+          updateSubscribeButton(currentItem());
         }
         updateLikeState(item);
       }
@@ -3075,17 +3183,18 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
       return;
     }
     if(index < feed.length - 1){
-      index += 1;
-      render();
+      setIndex(index + 1, {scroll:true});
     } else if(feed.length < total){
       fetchMore().then(()=>{
         if(index < feed.length - 1){
-          index += 1;
-          render();
+          setIndex(index + 1, {scroll:true});
         } else {
+          updateScrollFiller();
           updateCounter();
         }
       });
+    } else {
+      scrollToCurrent(false);
     }
   }
 
@@ -3094,8 +3203,9 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
       return;
     }
     if(index > 0){
-      index -= 1;
-      render();
+      setIndex(index - 1, {scroll:true});
+    } else {
+      scrollToCurrent(false);
     }
   }
 
@@ -3105,17 +3215,43 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
       return;
     }
     lastNav = now;
-    if(direction > 0){
-      gotoNext();
-    } else {
-      gotoPrev();
-    }
+    setIndex(direction > 0 ? index + 1 : index - 1, {scroll:true});
   }
 
   likeBtn.addEventListener('click', toggleLike);
   subscribeBtn.addEventListener('click', toggleSubscription);
   prevBtn.addEventListener('click', ()=>handleNavigate(-1));
   nextBtn.addEventListener('click', ()=>handleNavigate(1));
+
+  stage.addEventListener('scroll', ()=>{
+    if(scrollLock){
+      return;
+    }
+    const height = stageHeight();
+    if(!height){
+      return;
+    }
+    const target = clampIndexValue(Math.round(stage.scrollTop / height));
+    if(target !== index){
+      index = target;
+      render();
+    }
+    if(scrollSnapTimer){
+      clearTimeout(scrollSnapTimer);
+    }
+    scrollSnapTimer = setTimeout(()=>{
+      if(scrollLock){
+        return;
+      }
+      scrollToCurrent(false);
+    }, 120);
+  }, {passive:true});
+
+  window.addEventListener('resize', ()=>{
+    updateScrollFiller();
+    scrollToCurrent(true);
+  });
+
   soundToggle.addEventListener('click', ()=>{
     soundEnabled = !soundEnabled;
     updateSoundUI();
@@ -3151,14 +3287,6 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
     }
   });
 
-  window.addEventListener('wheel', (event)=>{
-    event.preventDefault();
-    if(Math.abs(event.deltaY) < 40){
-      return;
-    }
-    handleNavigate(event.deltaY > 0 ? 1 : -1);
-  }, {passive:false});
-
   window.addEventListener('keydown', (event)=>{
     if(event.key === 'ArrowDown' || event.key === 'PageDown'){
       event.preventDefault();
@@ -3178,33 +3306,8 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe 
     }
   });
 
-  let touchStartY = null;
-  stage.addEventListener('touchstart', (event)=>{
-    if(event.touches && event.touches.length === 1){
-      touchStartY = event.touches[0].clientY;
-    }
-  }, {passive:true});
-
-  stage.addEventListener('touchmove', (event)=>{
-    if(touchStartY !== null){
-      event.preventDefault();
-    }
-  }, {passive:false});
-
-  stage.addEventListener('touchend', (event)=>{
-    if(touchStartY === null){
-      return;
-    }
-    const endY = event.changedTouches && event.changedTouches.length ? event.changedTouches[0].clientY : touchStartY;
-    const delta = endY - touchStartY;
-    touchStartY = null;
-    if(Math.abs(delta) < 60){
-      return;
-    }
-    handleNavigate(delta < 0 ? 1 : -1);
-  });
-
   render();
+  scrollToCurrent(true);
 })();
 </script>
 </body>
@@ -4862,6 +4965,8 @@ def api_short_view():
     if not path:
         return jsonify({"ok": False}), 400
     refresh_video_index()
+    if not has_video_access(path):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
     if path not in VIDEO_INDEX:
         refresh_video_index(force=True)
     if path not in VIDEO_INDEX:
