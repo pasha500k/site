@@ -1,0 +1,5846 @@
+# -*- coding: utf-8 -*-
+"""Single-file video site with account-backed likes and favorites."""
+import argparse
+import os
+import re
+import json
+import base64
+import random
+import tempfile
+import subprocess
+import asyncio
+import time
+import hashlib
+import hmac
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from functools import wraps
+from typing import List, Dict, Tuple, Optional, Set, Iterable
+import uuid
+
+from flask import (
+    Flask, render_template_string, request, url_for, abort,
+    Response, send_file, redirect, jsonify, make_response, stream_with_context,
+    session, g, has_app_context
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.http import parse_range_header, http_date
+from werkzeug.wsgi import wrap_file
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("APP_SECRET_KEY", "change-me")
+
+# -------------------------
+# CONFIG
+# -------------------------
+VIDEO_ROOT    = r"E:\PH_Dowloader_TG+WEB\downloads"
+PREVIEW_ROOT  = os.path.join(VIDEO_ROOT, "__previews__")
+UPLOAD_ROOT   = os.path.join(VIDEO_ROOT, "__uploads__")
+ALLOWED_EXT   = {".mp4"}
+
+ADMIN_SECRET_PLAIN = os.environ.get("ADMIN_DEFAULT_PASSWORD", "Hehetoto123")
+ADMIN_USERNAME = os.environ.get("ADMIN_DEFAULT_USERNAME", "admin")
+
+# секрет для подписи access-токенов (HMAC)
+ACCESS_SIGN_SECRET = (ADMIN_SECRET_PLAIN + "::access").encode("utf-8")
+ACCESS_TOKEN_TTL_SEC = 10 * 60  # 10 минут
+
+DATABASE_PATH = os.path.join(VIDEO_ROOT, "app.db")
+SQLITE_MAX_VARIABLES = 999
+SEARCH_RESULT_LIMIT = 250
+
+os.makedirs(PREVIEW_ROOT, exist_ok=True)
+os.makedirs(UPLOAD_ROOT, exist_ok=True)
+os.makedirs(VIDEO_ROOT, exist_ok=True)
+
+FFMPEG_CHECK_TIMEOUT = int(os.environ.get("FFMPEG_CHECK_TIMEOUT", "180"))
+FFMPEG_FIX_COPY_TIMEOUT = int(os.environ.get("FFMPEG_FIX_COPY_TIMEOUT", "900"))
+FFMPEG_FIX_TRANSCODE_TIMEOUT = int(os.environ.get("FFMPEG_FIX_TRANSCODE_TIMEOUT", "1800"))
+
+# -------------------------
+# METADATA FILES
+# -------------------------
+TRANSL_CACHE_PATH = os.path.join(VIDEO_ROOT, "translations.json")
+DUR_CACHE_PATH    = os.path.join(VIDEO_ROOT, "durations.json")
+VIEWS_PATH        = os.path.join(VIDEO_ROOT, "views.json")
+PROTECTED_PATH    = os.path.join(VIDEO_ROOT, "protected_folders.json")  # {"rel/path": "sha256_hash"}
+
+def load_json(path, default):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+
+def save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+_trans_cache: Dict[str, str] = load_json(TRANSL_CACHE_PATH, {})
+_dur_cache: Dict[str, float]  = load_json(DUR_CACHE_PATH, {})
+_views: Dict[str, int]        = load_json(VIEWS_PATH, {})
+_protected = load_json(PROTECTED_PATH, {})
+
+# in-memory buckets for lightweight rate limiting / bot protection
+_rate_buckets: Dict[str, deque] = {}
+
+# hot caches for aggregate stats to avoid hammering sqlite on large libraries
+REACTION_CACHE: Dict[str, Dict[str, int]] = {}
+FAVORITE_CACHE: Dict[str, int] = {}
+
+# author → video paths mapping built from the on-disk index
+AUTHOR_VIDEO_INDEX: Dict[str, List[str]] = {}
+
+# frequently accessed popular videos (by view count)
+POPULAR_CACHE: List[str] = []
+POPULAR_CACHE_DIRTY = True
+POPULAR_CACHE_LAST_BUILD = 0.0
+POPULAR_CACHE_TTL = 60.0
+POPULAR_CACHE_MAX = 600
+
+# cached co-watch transitions (direction, path) -> List[(path, weight)]
+TRANSITION_CACHE: Dict[Tuple[str, str], List[Tuple[str, float]]] = {}
+TRANSITION_CACHE_LOCK = threading.Lock()
+
+# cached collaborative signals (per video) -> (timestamp, watch_list, reaction_list)
+COLLAB_CACHE: Dict[str, Tuple[float, List[Tuple[str, float]], List[Tuple[str, float]]]] = {}
+COLLAB_CACHE_TTL = 180.0
+COLLAB_CACHE_MAX = 800
+COLLAB_CACHE_LOCK = threading.Lock()
+
+# shorts configuration (seconds)
+SHORTS_MAX_DURATION = float(os.environ.get("SHORTS_MAX_DURATION", "0"))
+SHORTS_INITIAL_BATCH = max(int(os.environ.get("SHORTS_INITIAL_BATCH", "12")), 1)
+SHORTS_API_BATCH = max(int(os.environ.get("SHORTS_API_BATCH", "10")), 1)
+
+
+def mark_popular_dirty() -> None:
+    global POPULAR_CACHE_DIRTY
+    POPULAR_CACHE_DIRTY = True
+
+
+def save_trans_cache(): save_json(TRANSL_CACHE_PATH, _trans_cache)
+
+def save_dur_cache():   save_json(DUR_CACHE_PATH, _dur_cache)
+
+def save_views():       save_json(VIEWS_PATH, _views)
+
+def save_protected():   save_json(PROTECTED_PATH, _protected)
+
+
+# -------------------------
+# DATABASE
+# -------------------------
+
+def init_db():
+    conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        conn.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                is_moderator INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS reactions (
+                user_id INTEGER NOT NULL,
+                video_path TEXT NOT NULL,
+                reaction TEXT NOT NULL CHECK (reaction IN ('like','dislike')),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, video_path),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id INTEGER NOT NULL,
+                video_path TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, video_path),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS view_events (
+                fingerprint TEXT NOT NULL,
+                video_path TEXT NOT NULL,
+                user_id INTEGER,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(fingerprint, video_path),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS video_metadata (
+                video_path TEXT PRIMARY KEY,
+                author_override TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS watch_sessions (
+                session_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                user_id INTEGER,
+                video_path TEXT NOT NULL,
+                watched_seconds REAL NOT NULL DEFAULT 0,
+                duration_seconds REAL,
+                meaningful INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS watch_cursor (
+                fingerprint TEXT PRIMARY KEY,
+                last_video_path TEXT,
+                last_session_id TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS video_transitions (
+                from_path TEXT NOT NULL,
+                to_path TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 0,
+                last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(from_path, to_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_watch_sessions_user ON watch_sessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_watch_sessions_video ON watch_sessions(video_path);
+            CREATE INDEX IF NOT EXISTS idx_video_transitions_from ON video_transitions(from_path);
+            CREATE INDEX IF NOT EXISTS idx_video_transitions_to ON video_transitions(to_path);
+            CREATE TABLE IF NOT EXISTS folder_access (
+                user_id INTEGER NOT NULL,
+                folder_path TEXT NOT NULL,
+                granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, folder_path),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS author_subscriptions (
+                user_id INTEGER NOT NULL,
+                author TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(user_id, author),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS user_stats (
+                user_id INTEGER PRIMARY KEY,
+                views_count INTEGER NOT NULL DEFAULT 0,
+                seconds_watched REAL NOT NULL DEFAULT 0,
+                last_view_at TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS uploads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                stored_name TEXT NOT NULL,
+                original_name TEXT NOT NULL,
+                target_folder TEXT NOT NULL,
+                final_path TEXT,
+                status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected')) DEFAULT 'pending',
+                moderator_id INTEGER,
+                notes TEXT,
+                size_bytes INTEGER,
+                duration_seconds REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(moderator_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status);
+            """
+        )
+        conn.commit()
+        def has_column(table: str, column: str) -> bool:
+            cur = conn.execute(f"PRAGMA table_info({table})")
+            return any(row[1] == column for row in cur.fetchall())
+
+        if not has_column("users", "is_moderator"):
+            conn.execute("ALTER TABLE users ADD COLUMN is_moderator INTEGER NOT NULL DEFAULT 0")
+
+        if not has_column("uploads", "final_path"):
+            conn.execute("ALTER TABLE uploads ADD COLUMN final_path TEXT")
+        if not has_column("uploads", "target_folder"):
+            conn.execute("ALTER TABLE uploads ADD COLUMN target_folder TEXT NOT NULL DEFAULT 'community'")
+        if not has_column("uploads", "duration_seconds"):
+            conn.execute("ALTER TABLE uploads ADD COLUMN duration_seconds REAL")
+        if not has_column("uploads", "size_bytes"):
+            conn.execute("ALTER TABLE uploads ADD COLUMN size_bytes INTEGER")
+
+        if not has_column("watch_sessions", "meaningful"):
+            conn.execute("ALTER TABLE watch_sessions ADD COLUMN meaningful INTEGER NOT NULL DEFAULT 0")
+        if not has_column("watch_sessions", "duration_seconds"):
+            conn.execute("ALTER TABLE watch_sessions ADD COLUMN duration_seconds REAL")
+
+        cur = conn.execute("SELECT id FROM users WHERE is_admin=1 LIMIT 1")
+        if cur.fetchone() is None:
+            conn.execute(
+                "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)",
+                (ADMIN_USERNAME, generate_password_hash(ADMIN_SECRET_PLAIN))
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DATABASE_PATH)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(exception):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def _rate_key(prefix: str) -> str:
+    ident = request.remote_addr or "unknown"
+    user = getattr(g, "user", None)
+    if user is not None:
+        ident = f"user:{user['id']}"
+    return f"{prefix}:{ident}"
+
+
+def allow_rate(prefix: str, limit: int, window_sec: int) -> bool:
+    key = _rate_key(prefix)
+    bucket = _rate_buckets.setdefault(key, deque())
+    now = time.time()
+    while bucket and now - bucket[0] > window_sec:
+        bucket.popleft()
+    if len(bucket) >= limit:
+        return False
+    bucket.append(now)
+    # prevent unbounded growth in long-running processes
+    while len(bucket) > limit:
+        bucket.popleft()
+    return True
+
+
+def viewer_identity(resp=None) -> Tuple[str, Optional[int]]:
+    user = getattr(g, "user", None)
+    if user is not None:
+        return f"user:{user['id']}", user["id"]
+    uid = get_user_cookie(resp)
+    return f"anon:{uid}", None
+
+
+def _update_user_stats(
+    db: sqlite3.Connection,
+    user_id: Optional[int],
+    seconds_delta: float = 0.0,
+    increment_view: bool = False,
+) -> None:
+    if user_id is None:
+        return
+    seconds = max(float(seconds_delta or 0.0), 0.0)
+    view_inc = 1 if increment_view else 0
+    db.execute(
+        """
+        INSERT INTO user_stats (user_id, views_count, seconds_watched, last_view_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            views_count = user_stats.views_count + ?,
+            seconds_watched = user_stats.seconds_watched + ?,
+            last_view_at = CURRENT_TIMESTAMP
+        """,
+        (user_id, view_inc, seconds, view_inc, seconds)
+    )
+
+
+def register_view_if_new(video_path: str, resp=None) -> bool:
+    fingerprint, user_id = viewer_identity(resp)
+    db = get_db()
+    row = db.execute(
+        "SELECT 1 FROM view_events WHERE fingerprint = ? AND video_path = ?",
+        (fingerprint, video_path)
+    ).fetchone()
+    if row:
+        return False
+    db.execute(
+        "INSERT INTO view_events (fingerprint, video_path, user_id) VALUES (?, ?, ?)",
+        (fingerprint, video_path, user_id)
+    )
+    if user_id is not None:
+        _update_user_stats(db, user_id, seconds_delta=0.0, increment_view=True)
+    db.commit()
+    return True
+
+
+def user_has_persistent_access(scope_path: Optional[str]) -> bool:
+    user = getattr(g, "user", None)
+    if not scope_path or user is None:
+        return False
+    normalized = scope_path.strip("/")
+    if not normalized:
+        return False
+    parts = normalized.split("/")
+    db = get_db()
+    for i in range(len(parts), 0, -1):
+        candidate = "/".join(parts[:i])
+        row = db.execute(
+            "SELECT 1 FROM folder_access WHERE user_id = ? AND folder_path = ?",
+            (user["id"], candidate)
+        ).fetchone()
+        if row:
+            return True
+    return False
+
+
+def remember_folder_access(folder_path: str) -> None:
+    user = getattr(g, "user", None)
+    if user is None:
+        return
+    normalized = folder_path.strip("/")
+    if not normalized:
+        return
+    db = get_db()
+    db.execute(
+        "INSERT INTO folder_access (user_id, folder_path) VALUES (?, ?) "
+        "ON CONFLICT(user_id, folder_path) DO NOTHING",
+        (user["id"], normalized)
+    )
+    db.commit()
+
+
+def transition_cache_key(kind: str, path: str) -> Tuple[str, str]:
+    return (kind, normalize_rel_path(path))
+
+
+def invalidate_transition_cache_for(paths: Iterable[str]) -> None:
+    normalized = {normalize_rel_path(p) for p in paths if p}
+    if not normalized:
+        return
+    with TRANSITION_CACHE_LOCK:
+        keys_to_remove = [key for key in TRANSITION_CACHE.keys() if key[1] in normalized]
+        for key in keys_to_remove:
+            TRANSITION_CACHE.pop(key, None)
+
+
+def invalidate_collaborative_cache_for(paths: Iterable[str]) -> None:
+    normalized = {normalize_rel_path(p) for p in paths if p}
+    if not normalized:
+        return
+    with COLLAB_CACHE_LOCK:
+        for key in normalized:
+            COLLAB_CACHE.pop(key, None)
+
+
+def fetch_transition_list(kind: str, path: str, limit: int = 200) -> List[Tuple[str, float]]:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return []
+    key = transition_cache_key(kind, normalized)
+    with TRANSITION_CACHE_LOCK:
+        cached = TRANSITION_CACHE.get(key)
+    if cached is not None:
+        return cached[:limit]
+    db = get_db()
+    if kind == "out":
+        rows = db.execute(
+            "SELECT to_path AS neighbor, weight FROM video_transitions WHERE from_path = ? "
+            "ORDER BY weight DESC, last_update DESC LIMIT ?",
+            (normalized, limit),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT from_path AS neighbor, weight FROM video_transitions WHERE to_path = ? "
+            "ORDER BY weight DESC, last_update DESC LIMIT ?",
+            (normalized, limit),
+        ).fetchall()
+    results: List[Tuple[str, float]] = []
+    for row in rows:
+        neighbor = normalize_rel_path(row["neighbor"])
+        if not neighbor or neighbor == normalized:
+            continue
+        results.append((neighbor, float(row["weight"] or 0.0)))
+    with TRANSITION_CACHE_LOCK:
+        TRANSITION_CACHE[key] = results
+    return results[:limit]
+
+
+def get_sequence_neighbors(path: str, limit: int = 400) -> Dict[str, float]:
+    neighbors: Dict[str, float] = {}
+    for neighbor, weight in fetch_transition_list("out", path, limit):
+        neighbors[neighbor] = neighbors.get(neighbor, 0.0) + weight
+    for neighbor, weight in fetch_transition_list("in", path, limit):
+        neighbors[neighbor] = neighbors.get(neighbor, 0.0) + weight * 0.7
+    return neighbors
+
+
+def _compute_watch_collaborations(normalized: str, limit: int) -> List[Tuple[str, float]]:
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT
+            ws_other.video_path AS neighbor,
+            SUM(CASE WHEN ws_other.meaningful = 1 THEN 1 ELSE 0 END) AS meaningful_count,
+            SUM(COALESCE(ws_other.watched_seconds, 0)) AS total_seconds,
+            COUNT(*) AS overlap
+        FROM watch_sessions AS ws_current
+        JOIN watch_sessions AS ws_other
+          ON ws_current.user_id = ws_other.user_id
+        WHERE ws_current.video_path = ?
+          AND ws_other.video_path IS NOT NULL
+          AND ws_other.video_path != ?
+          AND ws_current.user_id IS NOT NULL
+          AND ws_current.meaningful = 1
+        GROUP BY ws_other.video_path
+        ORDER BY meaningful_count DESC, total_seconds DESC
+        LIMIT ?
+        """,
+        (normalized, normalized, limit),
+    ).fetchall()
+    results: List[Tuple[str, float]] = []
+    for row in rows:
+        neighbor = normalize_rel_path(row["neighbor"])
+        if not neighbor or neighbor == normalized:
+            continue
+        meaningful_count = float(row["meaningful_count"] or 0.0)
+        total_seconds = float(row["total_seconds"] or 0.0)
+        overlap = float(row["overlap"] or 0.0)
+        weight = meaningful_count * 4.0 + overlap * 0.75 + (total_seconds / 180.0)
+        if weight <= 0.0:
+            continue
+        results.append((neighbor, weight))
+    return results
+
+
+def _compute_reaction_collaborations(normalized: str, limit: int) -> List[Tuple[str, float]]:
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT
+            r2.video_path AS neighbor,
+            SUM(
+                CASE
+                    WHEN r1.reaction = 'like' AND r2.reaction = 'like' THEN 2.0
+                    WHEN r1.reaction = 'like' AND r2.reaction = 'dislike' THEN -1.2
+                    WHEN r1.reaction = 'dislike' AND r2.reaction = 'like' THEN 0.8
+                    ELSE -0.6
+                END
+            ) AS raw_score,
+            SUM(CASE WHEN r2.reaction = 'like' THEN 1 ELSE 0 END) AS like_count,
+            SUM(CASE WHEN r2.reaction = 'dislike' THEN 1 ELSE 0 END) AS dislike_count,
+            COUNT(*) AS overlap
+        FROM reactions AS r1
+        JOIN reactions AS r2 ON r1.user_id = r2.user_id
+        WHERE r1.video_path = ?
+          AND r2.video_path IS NOT NULL
+          AND r2.video_path != ?
+        GROUP BY r2.video_path
+        ORDER BY raw_score DESC
+        LIMIT ?
+        """,
+        (normalized, normalized, limit),
+    ).fetchall()
+    results: List[Tuple[str, float]] = []
+    for row in rows:
+        neighbor = normalize_rel_path(row["neighbor"])
+        if not neighbor or neighbor == normalized:
+            continue
+        raw_score = float(row["raw_score"] or 0.0)
+        like_count = float(row["like_count"] or 0.0)
+        dislike_count = float(row["dislike_count"] or 0.0)
+        overlap = float(row["overlap"] or 0.0)
+        weight = raw_score + like_count * 0.25 - dislike_count * 0.35 + overlap * 0.15
+        results.append((neighbor, weight))
+    return results
+
+
+def get_collaborative_scores(path: str, limit: int = 400) -> Tuple[Dict[str, float], Dict[str, float]]:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return {}, {}
+    now = time.time()
+    with COLLAB_CACHE_LOCK:
+        cached = COLLAB_CACHE.get(normalized)
+        if cached and (now - cached[0]) < COLLAB_CACHE_TTL:
+            watch_list, reaction_list = cached[1], cached[2]
+        else:
+            watch_list = _compute_watch_collaborations(normalized, COLLAB_CACHE_MAX)
+            reaction_list = _compute_reaction_collaborations(normalized, COLLAB_CACHE_MAX)
+            COLLAB_CACHE[normalized] = (now, watch_list, reaction_list)
+    watch_dict = dict(watch_list[:limit])
+    reaction_dict = dict(reaction_list[:limit])
+    return watch_dict, reaction_dict
+
+
+def walk_transition_scores(path: str, depth: int = 3, branch: int = 18, decay: float = 0.82) -> Dict[str, float]:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return {}
+    scores: Dict[str, float] = {}
+    frontier: Dict[str, float] = {normalized: 1.0}
+    visited: Set[str] = set()
+    for _ in range(depth):
+        next_frontier: Dict[str, float] = {}
+        for node, weight in frontier.items():
+            neighbors = fetch_transition_list("out", node, branch) + fetch_transition_list("in", node, branch)
+            if not neighbors:
+                continue
+            total = sum(max(float(w), 0.0) for _, w in neighbors)
+            if total <= 0.0:
+                continue
+            for neighbor, edge_weight in neighbors:
+                neighbor_norm = normalize_rel_path(neighbor)
+                if not neighbor_norm or neighbor_norm == normalized:
+                    continue
+                portion = max(float(edge_weight), 0.0) / total
+                propagated = weight * decay * portion
+                if propagated <= 0.0:
+                    continue
+                scores[neighbor_norm] = scores.get(neighbor_norm, 0.0) + propagated
+                next_frontier[neighbor_norm] = next_frontier.get(neighbor_norm, 0.0) + propagated
+        frontier = {node: w for node, w in next_frontier.items() if node not in visited}
+        visited.update(frontier.keys())
+        if not frontier:
+            break
+    return scores
+
+
+def record_transition(fingerprint: str, session_id: str, video_path: str) -> None:
+    normalized = normalize_rel_path(video_path)
+    if not normalized:
+        return
+    db = get_db()
+    row = db.execute(
+        "SELECT last_video_path FROM watch_cursor WHERE fingerprint = ?",
+        (fingerprint,),
+    ).fetchone()
+    previous = normalize_rel_path(row["last_video_path"]) if row and row["last_video_path"] else None
+    if previous and previous != normalized:
+        db.execute(
+            """
+            INSERT INTO video_transitions (from_path, to_path, weight, last_update)
+            VALUES (?, ?, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT(from_path, to_path) DO UPDATE SET
+                weight = video_transitions.weight + 1,
+                last_update = CURRENT_TIMESTAMP
+            """,
+            (previous, normalized),
+        )
+        invalidate_transition_cache_for([previous, normalized])
+        invalidate_collaborative_cache_for([previous, normalized])
+    db.execute(
+        """
+        INSERT INTO watch_cursor (fingerprint, last_video_path, last_session_id, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(fingerprint) DO UPDATE SET
+            last_video_path = excluded.last_video_path,
+            last_session_id = excluded.last_session_id,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (fingerprint, normalized, session_id),
+    )
+    invalidate_collaborative_cache_for([normalized])
+
+
+def is_meaningful_watch(watched_seconds: float, duration_seconds: float) -> bool:
+    watched = max(watched_seconds, 0.0)
+    duration = max(duration_seconds, 0.0)
+    if duration <= 0:
+        return watched >= 90.0
+    ratio = watched / duration if duration else 0.0
+    threshold = max(min(duration * 0.45, 600.0), 60.0)
+    if duration < 180.0:
+        threshold = max(duration * 0.6, 45.0)
+    return watched >= threshold or ratio >= 0.85 or watched >= 240.0
+
+
+def clear_folder_access(folder_path: str) -> None:
+    normalized = folder_path.strip("/")
+    if not normalized:
+        return
+    db = get_db()
+    db.execute("DELETE FROM folder_access WHERE folder_path = ?", (normalized,))
+    db.commit()
+
+
+def fetch_author_overrides() -> Dict[str, str]:
+    query = (
+        "SELECT video_path, author_override FROM video_metadata "
+        "WHERE author_override IS NOT NULL AND author_override <> ''"
+    )
+    if has_app_context():
+        db = get_db()
+        rows = db.execute(query).fetchall()
+    else:
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(query).fetchall()
+        finally:
+            conn.close()
+    return {
+        normalize_rel_path(row["video_path"]): row["author_override"]
+        for row in rows
+        if row["author_override"]
+    }
+
+
+def remove_author_overrides(
+    paths: List[str],
+    db: Optional[sqlite3.Connection] = None,
+    autocommit: bool = True,
+) -> None:
+    normalized = [normalize_rel_path(p) for p in paths if p]
+    if not normalized:
+        return
+    close_conn = False
+    own_connection = False
+    if db is None:
+        if has_app_context():
+            db = get_db()
+        else:
+            db = sqlite3.connect(DATABASE_PATH)
+            close_conn = True
+            own_connection = True
+    try:
+        for chunk in chunked_list(normalized, SQLITE_MAX_VARIABLES):
+            if not chunk:
+                continue
+            placeholders = ",".join(["?"] * len(chunk))
+            db.execute(
+                f"DELETE FROM video_metadata WHERE video_path IN ({placeholders})",
+                chunk,
+            )
+        if close_conn or (autocommit and not own_connection):
+            db.commit()
+    finally:
+        if close_conn and db is not None:
+            db.close()
+
+
+def set_video_author_override(
+    path: str, author: Optional[str], db: Optional[sqlite3.Connection] = None
+) -> None:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return
+    close_conn = False
+    if db is None:
+        if has_app_context():
+            db = get_db()
+        else:
+            db = sqlite3.connect(DATABASE_PATH)
+            close_conn = True
+    try:
+        if author:
+            db.execute(
+                """
+                INSERT INTO video_metadata (video_path, author_override, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(video_path) DO UPDATE SET
+                    author_override=excluded.author_override,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (normalized, author),
+            )
+        else:
+            db.execute(
+                "DELETE FROM video_metadata WHERE video_path = ?",
+                (normalized,),
+            )
+        if close_conn:
+            db.commit()
+    finally:
+        if close_conn and db is not None:
+            db.close()
+
+
+def author_for_path(path: str) -> Optional[str]:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return None
+    refresh_video_index()
+    base = VIDEO_INDEX.get(normalized)
+    if base:
+        author = base.get("author")
+        if author:
+            return author
+    return extract_author(normalized)
+
+
+@app.before_request
+def load_logged_in_user():
+    user_id = session.get("user_id")
+    g.user = None
+    if user_id is not None:
+        db = get_db()
+        row = db.execute(
+            "SELECT id, username, is_admin, is_moderator FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+        if row:
+            g.user = {
+                "id": row["id"],
+                "username": row["username"],
+                "is_admin": bool(row["is_admin"]),
+                "is_moderator": bool(row["is_moderator"])
+            }
+        else:
+            session.clear()
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped_view(**kwargs):
+        if g.user is None:
+            return redirect(url_for("login", next=request.url))
+        return view(**kwargs)
+    return wrapped_view
+
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped_view(**kwargs):
+        if g.user is None or not g.user.get("is_admin"):
+            abort(403)
+        return view(**kwargs)
+    return wrapped_view
+
+
+def moderator_required(view):
+    @wraps(view)
+    def wrapped_view(**kwargs):
+        if g.user is None or not is_moderator_request():
+            abort(403)
+        return view(**kwargs)
+    return wrapped_view
+
+
+init_db()
+
+# -------------------------
+# UI TEXTS
+# -------------------------
+UI_TEXT = {
+    "en": {
+        "root": "Root", "categories": "Categories", "videos": "Videos",
+        "search_placeholder": "Search the whole site...", "random": "Random",
+        "random_settings": "Random settings", "random_from": "Pick folders for Random",
+        "save": "Save", "download": "Download", "back": "Back", "delete": "Delete",
+        "checkfix": "Check & Fix", "similar_here": "Similar in this folder",
+        "similar_global": "From other folders", "not_found": "No videos in this folder.",
+        "nothing_found": "Nothing found.", "lang_btn": "RUS", "title_main": "Categories",
+        "favorites": "Favorites", "views": "views", "liked": "Liked", "disliked": "Disliked",
+        "saved_ok": "Saved", "fixed_ok": "Checked / fixed", "like": "Like", "dislike": "Dislike",
+        "locked": "Locked", "enter_pass": "Enter password", "open": "Open", "wrong_pass": "Wrong password",
+        "quality": "Quality", "original": "Original", "login": "Login", "logout": "Logout",
+        "register": "Register", "account": "Account", "too_many_attempts": "Too many attempts, try later",
+        "author": "Author", "recommendations": "Recommended for you", "upload": "Upload",
+        "shorts": "Shorts", "subscribe": "Subscribe", "unsubscribe": "Unsubscribe",
+        "subscribed": "Subscribed", "shorts_empty": "No shorts yet",
+        "shorts_hint": "Scroll down or swipe to move between shorts", "next_short": "Next",
+        "prev_short": "Previous", "open_short": "Watch full video",
+        "sound_on": "Sound on", "sound_off": "Sound off",
+        "account_stats": "Stats", "admin_panel": "Admin panel", "moderator_panel": "Moderator panel",
+        "pending_uploads": "Pending uploads", "approve": "Approve", "reject": "Reject", "notes": "Notes",
+        "target_folder": "Target folder", "status_pending": "Pending", "status_approved": "Approved",
+        "status_rejected": "Rejected", "moderator": "Moderator", "user": "User",
+        "role_admin": "Admin", "role_moderator": "Moderator", "role_user": "User",
+        "user_stats": "User statistics", "total_views": "Total views", "minutes_watched": "Minutes watched",
+        "average_watch": "Average minutes per view", "no_data": "No data yet", "uploads": "Uploads",
+        "submit_upload": "Submit upload", "select_file": "Select video", "choose_folder": "Choose folder",
+        "upload_success": "Upload submitted for review", "upload_error": "Failed to upload",
+        "upload_rules": "Videos must be in MP4 format", "view_file": "Download file",
+        "assign_moderators": "Manage moderators", "make_moderator": "Make moderator",
+        "manage_protected": "Protected folders",
+        "remove_moderator": "Remove moderator", "stats_summary": "Summary", "total_videos": "Videos",
+        "total_users": "Users", "favorites_count": "Favorites saved", "uploads_pending": "Pending",
+        "uploads_approved": "Approved", "uploads_rejected": "Rejected", "upload_history": "Your uploads",
+        "moderation_notes": "Moderation notes", "minutes_short": "minutes", "views_count": "Views",
+        "avg_minutes": "Average minutes", "last_view": "Last view",
+        "sort_by": "Sort by", "sort_name": "Alphabetical", "sort_popular": "Most viewed",
+        "sort_likes": "Most liked", "sort_duration": "Longest", "sort_date": "Newest"
+    },
+    "ru": {
+        "root": "Корень", "categories": "Категории", "videos": "Видео",
+        "search_placeholder": "Поиск по всему сайту...", "random": "Случайное",
+        "random_settings": "Настройки рандома", "random_from": "Выбери папки для «Случайного»",
+        "save": "Сохранить", "download": "Скачать", "back": "Назад", "delete": "Удалить",
+        "checkfix": "Проверить/исправить", "similar_here": "Похожие из этой категории",
+        "similar_global": "Из других категорий", "not_found": "Нет видео в этой папке.",
+        "nothing_found": "Ничего не найдено.", "lang_btn": "EN", "title_main": "Категории",
+        "favorites": "Избранное", "views": "просмотров", "liked": "Нравится", "disliked": "Не нравится",
+        "saved_ok": "Сохранено", "fixed_ok": "Проверено/исправлено", "like": "Лайк", "dislike": "Дизлайк",
+        "locked": "Закрыта", "enter_pass": "Введите пароль", "open": "Открыть", "wrong_pass": "Неверный пароль",
+        "quality": "Качество", "original": "Оригинал", "login": "Войти", "logout": "Выйти",
+        "register": "Регистрация", "account": "Аккаунт", "too_many_attempts": "Слишком много попыток, попробуйте позже",
+        "author": "Автор", "recommendations": "Рекомендации", "upload": "Загрузить",
+        "shorts": "Шортсы", "subscribe": "Подписаться", "unsubscribe": "Отписаться",
+        "subscribed": "Вы подписаны", "shorts_empty": "Нет коротких видео",
+        "shorts_hint": "Листайте вниз колесиком или свайпом, чтобы переключать шорты",
+        "next_short": "Далее", "prev_short": "Назад", "open_short": "Смотреть полностью",
+        "sound_on": "Включить звук", "sound_off": "Выключить звук",
+        "account_stats": "Статистика", "admin_panel": "Панель админа", "moderator_panel": "Панель модератора",
+        "pending_uploads": "Ожидают модерации", "approve": "Одобрить", "reject": "Отклонить",
+        "notes": "Комментарий", "target_folder": "Папка назначения", "status_pending": "Ожидает",
+        "status_approved": "Одобрено", "status_rejected": "Отклонено", "moderator": "Модератор",
+        "user": "Пользователь", "role_admin": "Админ", "role_moderator": "Модератор",
+        "role_user": "Пользователь", "user_stats": "Статистика пользователей", "total_views": "Всего просмотров",
+        "minutes_watched": "Минут просмотрено", "average_watch": "Среднее минут за просмотр",
+        "no_data": "Нет данных", "uploads": "Загрузки", "submit_upload": "Отправить",
+        "select_file": "Выберите видео", "choose_folder": "Выберите папку",
+        "upload_success": "Видео отправлено на модерацию", "upload_error": "Не удалось загрузить",
+        "upload_rules": "Видео должно быть в формате MP4", "view_file": "Скачать файл",
+        "assign_moderators": "Управление модераторами", "make_moderator": "Назначить модератором",
+        "manage_protected": "Защищённые папки",
+        "remove_moderator": "Снять модератора", "stats_summary": "Сводка", "total_videos": "Видео",
+        "total_users": "Пользователи", "favorites_count": "Добавлено в избранное",
+        "uploads_pending": "На модерации", "uploads_approved": "Одобрено", "uploads_rejected": "Отклонено",
+        "upload_history": "Ваши загрузки", "moderation_notes": "Комментарий модератора",
+        "minutes_short": "минут", "views_count": "Просмотры", "avg_minutes": "Среднее (мин)",
+        "last_view": "Последний просмотр",
+        "sort_by": "Сортировка", "sort_name": "По названию", "sort_popular": "По популярности",
+        "sort_likes": "По лайкам", "sort_duration": "По длительности", "sort_date": "По дате (новые)"
+    }
+}
+
+SORT_MODES: Tuple[str, ...] = ("name", "popular", "likes", "duration", "date")
+SORT_LABEL_KEYS = {
+    "name": "sort_name",
+    "popular": "sort_popular",
+    "likes": "sort_likes",
+    "duration": "sort_duration",
+    "date": "sort_date",
+}
+
+
+def build_sort_options(ui: Dict[str, str]) -> List[Tuple[str, str]]:
+    return [(mode, ui.get(SORT_LABEL_KEYS[mode], mode.title())) for mode in SORT_MODES]
+
+
+def resolve_sort_mode() -> str:
+    sort_mode = request.args.get("sort")
+    if request.method == "POST":
+        sort_mode = request.form.get("sort") or sort_mode
+    if not sort_mode or sort_mode not in SORT_MODES:
+        return "name"
+    return sort_mode
+
+
+def apply_sort(videos: List[Dict], sort_mode: str) -> None:
+    if not videos:
+        return
+    mode = sort_mode if sort_mode in SORT_MODES else "name"
+    if mode == "popular":
+        videos.sort(
+            key=lambda v: (
+                v.get("views", 0),
+                v.get("likes", 0),
+                v.get("favorites", 0),
+                v.get("duration_seconds", 0.0),
+            ),
+            reverse=True,
+        )
+    elif mode == "likes":
+        videos.sort(
+            key=lambda v: (
+                v.get("likes", 0),
+                v.get("views", 0),
+                v.get("duration_seconds", 0.0),
+            ),
+            reverse=True,
+        )
+    elif mode == "duration":
+        videos.sort(
+            key=lambda v: (
+                v.get("duration_seconds", 0.0) or 0.0,
+                v.get("views", 0),
+            ),
+            reverse=True,
+        )
+    elif mode == "date":
+        videos.sort(
+            key=lambda v: (
+                v.get("mtime", 0.0) or 0.0,
+                v.get("views", 0),
+            ),
+            reverse=True,
+        )
+    else:
+        videos.sort(key=lambda v: (v.get("display", "").lower(), v.get("path", "")))
+
+# -------------------------
+# TRANSLATOR (googletrans) with retries
+# -------------------------
+translator = None
+try:
+    from googletrans import Translator
+    translator = Translator(service_urls=['translate.googleapis.com','translate.google.com'])
+except Exception:
+    translator = None
+
+
+def contains_cyrillic(text: str) -> bool:
+    return any('А' <= ch <= 'я' or ch in 'Ёё' for ch in text)
+
+
+def contains_latin(text: str) -> bool:
+    return any('A' <= ch <= 'Z' or 'a' <= ch <= 'z' for ch in text)
+
+
+def split_name_ext(name: str) -> Tuple[str, str]:
+    base, ext = os.path.splitext(name)
+    return base, ext
+
+
+def should_translate_title(name: str, lang: str) -> bool:
+    if lang not in {"ru", "en"}:
+        return False
+    base, _ = split_name_ext(name)
+    if not base.strip():
+        return False
+    if lang == "ru":
+        return contains_latin(base) and not contains_cyrillic(base)
+    if lang == "en":
+        return contains_cyrillic(base) and not contains_latin(base)
+    return False
+
+
+def cached_translation(name: str, lang: str) -> Optional[str]:
+    entry = _trans_cache.get(name)
+    if isinstance(entry, dict):
+        return entry.get(lang)
+    if isinstance(entry, str) and lang == "ru":
+        return entry
+    return None
+
+
+def cache_translation(name: str, lang: str, translated: str) -> None:
+    entry = _trans_cache.get(name)
+    if isinstance(entry, dict):
+        entry[lang] = translated
+    elif isinstance(entry, str):
+        if lang == "ru":
+            _trans_cache[name] = translated
+        else:
+            _trans_cache[name] = {"ru": entry, lang: translated}
+    else:
+        if lang == "ru":
+            _trans_cache[name] = translated
+        else:
+            _trans_cache[name] = {lang: translated}
+    save_trans_cache()
+
+
+def perform_translation(text: str, dest_lang: str) -> Optional[str]:
+    if not translator:
+        return None
+    for _ in range(3):
+        try:
+            result = translator.translate(text, dest=dest_lang)
+            if asyncio.iscoroutine(result):
+                try:
+                    result = asyncio.get_event_loop().run_until_complete(result)
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    result = loop.run_until_complete(result)
+                    loop.close()
+            translated = (getattr(result, "text", None) or "").strip()
+            if translated:
+                return translated
+        except Exception:
+            continue
+    return None
+
+
+def translate_title_if_needed(name: str, lang: str) -> str:
+    cached = cached_translation(name, lang)
+    if cached:
+        return cached
+    if not should_translate_title(name, lang):
+        return name
+    base, ext = split_name_ext(name)
+    translated_base = perform_translation(base, lang) or base
+    translated = f"{translated_base}{ext}"
+    cache_translation(name, lang, translated)
+    return translated
+
+# -------------------------
+# ACCESS TOKEN HELPERS (no cookies, HMAC query)
+# -------------------------
+def hmac_b64(data: str) -> str:
+    sig = hmac.new(ACCESS_SIGN_SECRET, data.encode("utf-8"), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(sig).decode().rstrip("=")
+
+
+def mk_access_signature(scope_path: str, exp_ts: int) -> str:
+    payload = f"{scope_path}|{exp_ts}"
+    return hmac_b64(payload)
+
+
+def verify_access_signature(scope_path: str, exp_ts: str, sig: str) -> bool:
+    try:
+        exp_i = int(exp_ts)
+    except Exception:
+        return False
+    if exp_i < int(time.time()):
+        return False
+    expected = mk_access_signature(scope_path, exp_i)
+    def norm(x: str) -> str: return (x or "").rstrip("=")
+    return hmac.compare_digest(norm(expected), norm(sig))
+
+
+def get_protected_root_for(rel_path: str) -> Optional[str]:
+    parts = rel_path.split("/")
+    for i in range(len(parts), 0, -1):
+        p = "/".join(parts[:i])
+        if p in _protected:
+            return p
+    return None
+
+
+def with_grant(url: str, scope: Optional[str]) -> str:
+    if not scope:
+        return url
+    if is_admin_request() or user_has_persistent_access(scope):
+        return url
+    exp = int(time.time()) + ACCESS_TOKEN_TTL_SEC
+    sig = mk_access_signature(scope, exp)
+    delim = "&" if ("?" in url) else "?"
+    return f"{url}{delim}exp={exp}&sig={sig}"
+
+
+def has_video_access(path: str) -> bool:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return False
+    scope = get_protected_root_for(normalized)
+    if scope is None:
+        return True
+    if not has_app_context():
+        return True
+    if is_admin_request() or is_moderator_request():
+        return True
+    return user_has_persistent_access(scope)
+
+
+def is_admin_request(req=None) -> bool:
+    user = getattr(g, "user", None)
+    if user and user.get("is_admin"):
+        return True
+    return False
+
+
+def is_moderator_request() -> bool:
+    user = getattr(g, "user", None)
+    if not user:
+        return False
+    return bool(user.get("is_admin") or user.get("is_moderator"))
+
+
+# -------------------------
+# UTILITIES
+# -------------------------
+def safe_join(root: str, subpath: str) -> str:
+    full = os.path.abspath(os.path.join(root, subpath))
+    if not full.startswith(os.path.abspath(root)):
+        abort(403)
+    return full
+
+
+def get_lang() -> Tuple[str, Dict[str, str]]:
+    lang = (request.cookies.get("lang") or "ru").lower()
+    if lang not in ("ru","en"):
+        lang = "ru"
+    return lang, UI_TEXT[lang]
+
+
+AUTHOR_SOURCES = [
+    "FROM",
+    "downloads/PornHub"
+]
+
+
+def normalize_rel_path(rel_path: str) -> str:
+    if not rel_path:
+        return ""
+    normalized = rel_path.replace("\\", "/").strip()
+    normalized = normalized.strip("/")
+    if normalized == ".":
+        return ""
+    return normalized
+
+
+def sanitize_folder_name(folder: str) -> str:
+    normalized = normalize_rel_path(folder)
+    if not normalized:
+        return "community"
+    parts = []
+    for part in normalized.split("/"):
+        clean = re.sub(r"[^0-9A-Za-z _-]+", "_", part).strip(" _")
+        if not clean:
+            continue
+        if clean.startswith("__"):
+            clean = clean.lstrip("_") or "folder"
+        parts.append(clean)
+    return "/".join(parts) if parts else "community"
+
+
+def sanitize_filename(name: str, default: str = "video") -> str:
+    base, ext = os.path.splitext(name)
+    clean_base = re.sub(r"[^0-9A-Za-z _-]+", "_", base).strip(" _") or default
+    return clean_base + (ext or ".mp4")
+
+
+def chunked_list(items: List[str], size: int):
+    if size <= 0 or not items:
+        if items:
+            yield items
+        return
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def extract_author(rel_path: str) -> Optional[str]:
+    normalized = normalize_rel_path(rel_path)
+    if not normalized:
+        return None
+    parts = normalized.split("/")
+    for prefix in AUTHOR_SOURCES:
+        prefix_parts = normalize_rel_path(prefix).split("/")
+        if parts[:len(prefix_parts)] == prefix_parts:
+            remainder = parts[len(prefix_parts):]
+            if prefix.upper() == "FROM" or not remainder:
+                return prefix_parts[-1]
+            candidate = remainder[0]
+            if "." in candidate and len(remainder) == 1:
+                return prefix_parts[-1]
+            if candidate:
+                return candidate
+            return prefix_parts[-1]
+    if parts:
+        first = parts[0]
+        if "." in first:
+            if len(parts) > 1 and "." not in parts[1]:
+                return parts[1]
+            return None
+        return first
+    return None
+
+
+def author_from_full_path(full_path: str) -> Optional[str]:
+    rel = os.path.relpath(full_path, VIDEO_ROOT)
+    return author_for_path(rel)
+
+
+def get_user_cookie(resp=None) -> str:
+    uid = request.cookies.get("uid")
+    if uid:
+        return uid
+    uid = base64.b16encode(os.urandom(8)).decode().lower()
+    if resp is None:
+        resp = make_response()
+    resp.set_cookie("uid", uid, max_age=60*60*24*365, path="/")
+    return uid
+
+
+def ffprobe_duration(video_path: str) -> float:
+    rel = os.path.relpath(video_path, VIDEO_ROOT).replace("\\","/")
+    if rel in _dur_cache:
+        return _dur_cache[rel]
+    try:
+        out = subprocess.check_output(
+            ["ffprobe","-v","error","-show_entries","format=duration",
+             "-of","default=noprint_wrappers=1:nokey=1", video_path],
+            stderr=subprocess.STDOUT
+        )
+        dur = float(out.strip())
+    except Exception:
+        dur = 60.0
+    _dur_cache[rel] = dur
+    save_dur_cache()
+    return dur
+
+
+def probe_video_size(video_path: str) -> Tuple[int,int]:
+    """Return (width,height) using ffprobe; fallback (1280,720)."""
+    try:
+        out = subprocess.check_output(
+            ["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=width,height",
+             "-of","csv=p=0:s=x", video_path],
+            stderr=subprocess.STDOUT
+        )
+        s = out.decode().strip()
+        if "x" in s:
+            w,h = s.split("x")
+            return int(w), int(h)
+    except Exception:
+        pass
+    return 1280, 720
+
+
+def format_duration(seconds: float) -> str:
+    s = int(round(seconds))
+    h = s // 3600; s %= 3600
+    m = s // 60; s %= 60
+    if h > 0: return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def thumbnail_timestamp(video_path: str) -> float:
+    duration = ffprobe_duration(video_path)
+    if duration <= 0:
+        return 1.0
+    midpoint = duration / 2.0
+    return max(0.0, midpoint)
+
+
+def generate_thumbnail(video_path: str) -> str:
+    thumb_path = os.path.splitext(video_path)[0] + ".jpg"
+    if not os.path.exists(thumb_path):
+        ts = thumbnail_timestamp(video_path)
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg","-y","-ss",f"{ts:.3f}","-i",video_path,
+                    "-frames:v","1","-q:v","2",thumb_path
+                ],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass
+    return thumb_path
+
+# preview settings
+PREVIEW_CLIPS = 3
+PREVIEW_CLIP_SEC = 2.5
+PREVIEW_WIDTH = 720
+
+
+def ensure_preview(video_path: str) -> str:
+    rel = os.path.relpath(video_path, VIDEO_ROOT)
+    rel_preview = os.path.splitext(rel)[0] + ".preview.mp4"
+    preview_path = os.path.join(PREVIEW_ROOT, rel_preview)
+    os.makedirs(os.path.dirname(preview_path), exist_ok=True)
+    if os.path.exists(preview_path):
+        return preview_path
+
+    dur = max(10.0, ffprobe_duration(video_path))
+    positions = [0.20, 0.50, 0.80]
+    starts = [max(0.0, dur * p - PREVIEW_CLIP_SEC/2) for p in positions][:PREVIEW_CLIPS]
+
+    tmpdir = tempfile.mkdtemp(dir=os.path.dirname(preview_path))
+    segs = []
+    try:
+        for i, st in enumerate(starts, 1):
+            seg = os.path.join(tmpdir, f"seg{i}.mp4")
+            subprocess.run(
+                ["ffmpeg","-y","-ss",str(st),"-t",str(PREVIEW_CLIP_SEC),"-i",video_path,
+                 "-vf",f"scale={PREVIEW_WIDTH}:-2:flags=bicubic",
+                 "-an","-c:v","libx264","-preset","veryfast","-crf","23",
+                 "-movflags","+faststart", seg],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            if os.path.exists(seg):
+                segs.append(seg)
+        concat_list = os.path.join(tmpdir,"list.txt")
+        with open(concat_list,"w",encoding="utf-8") as f:
+            for p in segs:
+                f.write("file '{}'\n".format(p.replace('\\','/')))
+        subprocess.run(
+            ["ffmpeg","-y","-f","concat","-safe","0","-i",concat_list,"-c","copy","-movflags","+faststart", preview_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    finally:
+        try:
+            for p in segs:
+                if os.path.exists(p): os.remove(p)
+            if os.path.exists(concat_list): os.remove(concat_list)
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
+
+    return preview_path
+
+# -------------------------
+# Directory walkers
+# -------------------------
+def list_subfolders(dir_abs: str) -> List[Dict]:
+    res = []
+    if not os.path.isdir(dir_abs):
+        return res
+    for name in os.listdir(dir_abs):
+        if name.startswith("__"):
+            continue
+        full = os.path.join(dir_abs, name)
+        if os.path.isdir(full) and os.path.abspath(full) != os.path.abspath(PREVIEW_ROOT):
+            rel = os.path.relpath(full, VIDEO_ROOT).replace("\\","/")
+            disp_name = name
+            if rel in _protected:
+                disp_name = f"🔒 {name}"
+            res.append({"name": disp_name, "path": rel, "raw_path": rel})
+    res.sort(key=lambda x: x["name"].lower())
+    return res
+
+
+VIDEO_INDEX: Dict[str, Dict] = {}
+VIDEO_INDEX_LAST_SCAN = 0.0
+VIDEO_INDEX_MIN_INTERVAL = 15.0
+VIDEO_INDEX_CACHE_PATH = os.path.join(VIDEO_ROOT, "video_index.json")
+VIDEO_INDEX_LOCK = threading.Lock()
+
+
+def apply_video_index(data: Dict[str, Dict]) -> None:
+    """Replace the in-memory index from a cached payload."""
+    global VIDEO_INDEX, AUTHOR_VIDEO_INDEX
+    new_index: Dict[str, Dict] = {}
+    author_map: Dict[str, List[str]] = {}
+    author_overrides = fetch_author_overrides()
+    for rel, payload in (data or {}).items():
+        if not isinstance(payload, dict):
+            continue
+        normalized_rel = normalize_rel_path(rel)
+        if not normalized_rel:
+            continue
+        entry = payload.copy()
+        entry["path"] = normalized_rel
+        if "duration" not in entry and entry.get("duration_seconds") is not None:
+            entry["duration"] = format_duration(entry.get("duration_seconds", 0.0))
+        override = author_overrides.get(normalized_rel)
+        if override:
+            entry["author"] = override
+        elif "author" in entry and entry["author"] is not None:
+            entry["author"] = entry["author"]
+        else:
+            entry["author"] = extract_author(normalized_rel)
+        new_index[normalized_rel] = entry
+        author = entry.get("author")
+        if author:
+            author_map.setdefault(author, []).append(normalized_rel)
+    VIDEO_INDEX = new_index
+    AUTHOR_VIDEO_INDEX = author_map
+    mark_popular_dirty()
+
+
+def persist_video_index() -> None:
+    """Persist the current index to disk so future boots start warm."""
+    payload = {"generated_at": time.time(), "videos": VIDEO_INDEX}
+    tmp_path = VIDEO_INDEX_CACHE_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp_path, VIDEO_INDEX_CACHE_PATH)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def load_video_index_cache() -> bool:
+    """Load a previously persisted index if present."""
+    if not os.path.exists(VIDEO_INDEX_CACHE_PATH):
+        return False
+    try:
+        with open(VIDEO_INDEX_CACHE_PATH, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        videos = payload.get("videos") if isinstance(payload, dict) else None
+        if isinstance(videos, dict):
+            apply_video_index(videos)
+            generated_at = payload.get("generated_at") if isinstance(payload, dict) else None
+            if isinstance(generated_at, (int, float)):
+                global VIDEO_INDEX_LAST_SCAN
+                VIDEO_INDEX_LAST_SCAN = generated_at
+            return True
+    except Exception:
+        pass
+    return False
+
+
+load_video_index_cache()
+
+
+def is_allowed_video_file(name: str) -> bool:
+    return os.path.splitext(name)[1].lower() in ALLOWED_EXT
+
+
+def iter_video_files(root_dir: str):
+    """Efficiently yield video files using scandir to minimize stat calls."""
+    stack = [os.path.abspath(root_dir)]
+    preview_abs = os.path.abspath(PREVIEW_ROOT)
+    upload_abs = os.path.abspath(UPLOAD_ROOT)
+    while stack:
+        current = stack.pop()
+        if current in (preview_abs, upload_abs):
+            continue
+        try:
+            with os.scandir(current) as iterator:
+                for entry in iterator:
+                    name = entry.name
+                    if name.startswith("__"):
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        if entry.is_file(follow_symlinks=False) and is_allowed_video_file(name):
+                            yield entry.path
+                    except FileNotFoundError:
+                        continue
+        except FileNotFoundError:
+            continue
+
+
+def refresh_video_index(force: bool = False) -> None:
+    global VIDEO_INDEX_LAST_SCAN, AUTHOR_VIDEO_INDEX
+    now = time.time()
+    if not force and (now - VIDEO_INDEX_LAST_SCAN) < VIDEO_INDEX_MIN_INTERVAL:
+        return
+    with VIDEO_INDEX_LOCK:
+        now = time.time()
+        if not force and (now - VIDEO_INDEX_LAST_SCAN) < VIDEO_INDEX_MIN_INTERVAL:
+            return
+        VIDEO_INDEX_LAST_SCAN = now
+        seen: set = set()
+        author_map: Dict[str, List[str]] = {}
+        author_overrides = fetch_author_overrides()
+        removed_overrides: List[str] = []
+        modified = False
+        for full_path in iter_video_files(VIDEO_ROOT):
+            rel = normalize_rel_path(os.path.relpath(full_path, VIDEO_ROOT))
+            seen.add(rel)
+            try:
+                stat = os.stat(full_path)
+            except FileNotFoundError:
+                continue
+            mtime = stat.st_mtime
+            size = stat.st_size
+            base = VIDEO_INDEX.get(rel)
+            needs_refresh = (
+                base is None
+                or base.get("mtime") != mtime
+                or base.get("size") != size
+            )
+            if needs_refresh:
+                duration_seconds = ffprobe_duration(full_path)
+                thumb = os.path.relpath(generate_thumbnail(full_path), VIDEO_ROOT).replace("\\", "/")
+                name = os.path.basename(full_path)
+                display_ru = translate_title_if_needed(name, "ru")
+                display_en = translate_title_if_needed(name, "en")
+                author_value = author_overrides.get(rel) or extract_author(rel)
+                base = {
+                    "name": name,
+                    "path": rel,
+                    "directory": normalize_rel_path(os.path.relpath(os.path.dirname(full_path), VIDEO_ROOT)),
+                    "thumb": thumb,
+                    "duration_seconds": duration_seconds,
+                    "duration": format_duration(duration_seconds),
+                    "author": author_value,
+                    "mtime": mtime,
+                    "size": size,
+                    "display_ru": display_ru,
+                    "display_en": display_en,
+                    "search_key_ru": display_ru.lower(),
+                    "search_key_en": display_en.lower(),
+                }
+                VIDEO_INDEX[rel] = base
+                modified = True
+            else:
+                base_modified = False
+                if "display_ru" not in base:
+                    display_ru = translate_title_if_needed(base["name"], "ru")
+                    base["display_ru"] = display_ru
+                    base["search_key_ru"] = display_ru.lower()
+                    base_modified = True
+                if "display_en" not in base:
+                    display_en = translate_title_if_needed(base["name"], "en")
+                    base["display_en"] = display_en
+                    base["search_key_en"] = display_en.lower()
+                    base_modified = True
+                if "duration" not in base or "duration_seconds" not in base:
+                    duration_seconds = ffprobe_duration(full_path)
+                    base["duration_seconds"] = duration_seconds
+                    base["duration"] = format_duration(duration_seconds)
+                    base_modified = True
+                if base.get("mtime") != mtime:
+                    base["mtime"] = mtime
+                    base_modified = True
+                if base.get("size") != size:
+                    base["size"] = size
+                    base_modified = True
+                override = author_overrides.get(rel)
+                if override:
+                    if base.get("author") != override:
+                        base["author"] = override
+                        base_modified = True
+                else:
+                    inferred = extract_author(rel)
+                    if base.get("author") != inferred:
+                        base["author"] = inferred
+                        base_modified = True
+                if base_modified:
+                    modified = True
+            author = base.get("author")
+            if author:
+                author_map.setdefault(author, []).append(rel)
+        removed_paths: List[str] = []
+        for rel in list(VIDEO_INDEX.keys()):
+            if rel not in seen:
+                VIDEO_INDEX.pop(rel, None)
+                removed_overrides.append(rel)
+                removed_paths.append(rel)
+                modified = True
+        AUTHOR_VIDEO_INDEX = author_map
+        if modified:
+            persist_video_index()
+            mark_popular_dirty()
+        if removed_overrides:
+            remove_author_overrides(removed_overrides)
+        if removed_paths:
+            invalidate_transition_cache_for(removed_paths)
+            invalidate_collaborative_cache_for(removed_paths)
+            if removed_paths:
+                close_conn = False
+                if has_app_context():
+                    db = get_db()
+                else:
+                    db = sqlite3.connect(DATABASE_PATH)
+                    close_conn = True
+                try:
+                    for chunk in chunked_list(removed_paths, SQLITE_MAX_VARIABLES):
+                        if not chunk:
+                            continue
+                        placeholders = ",".join(["?"] * len(chunk))
+                        db.execute(
+                            f"DELETE FROM video_transitions WHERE from_path IN ({placeholders}) OR to_path IN ({placeholders})",
+                            tuple(chunk + chunk),
+                        )
+                        db.execute(
+                            f"DELETE FROM watch_sessions WHERE video_path IN ({placeholders})",
+                            tuple(chunk),
+                        )
+                        db.execute(
+                            f"UPDATE watch_cursor SET last_video_path = NULL WHERE last_video_path IN ({placeholders})",
+                            tuple(chunk),
+                        )
+                    db.commit()
+                finally:
+                    if close_conn:
+                        db.close()
+
+
+def base_display_name(base: Dict, lang: str) -> str:
+    key = f"display_{lang}"
+    display = base.get(key)
+    if display:
+        return display
+    display = translate_title_if_needed(base["name"], lang)
+    base[key] = display
+    base[f"search_key_{lang}"] = display.lower()
+    return display
+
+
+def localized_video_entry(base: Dict, lang: str) -> Dict:
+    display_name = base_display_name(base, lang)
+    entry = {
+        "name": base["name"],
+        "display": display_name,
+        "path": base["path"],
+        "thumb": base["thumb"],
+        "duration": base["duration"],
+        "author": base.get("author"),
+        "duration_seconds": base.get("duration_seconds", 0.0),
+        "mtime": base.get("mtime", 0.0),
+    }
+    return entry
+
+
+def ensure_popular_cache() -> None:
+    global POPULAR_CACHE_DIRTY, POPULAR_CACHE_LAST_BUILD, POPULAR_CACHE
+    now = time.time()
+    if not POPULAR_CACHE_DIRTY and (now - POPULAR_CACHE_LAST_BUILD) < POPULAR_CACHE_TTL:
+        return
+    refresh_video_index()
+    sorted_by_views = sorted(_views.items(), key=lambda item: item[1], reverse=True)
+    seen: set = set()
+    popular: List[str] = []
+    for path, _count in sorted_by_views:
+        if path in VIDEO_INDEX and path not in seen:
+            popular.append(path)
+            seen.add(path)
+        if len(popular) >= POPULAR_CACHE_MAX:
+            break
+    if len(popular) < POPULAR_CACHE_MAX:
+        for path in VIDEO_INDEX.keys():
+            if path in seen:
+                continue
+            popular.append(path)
+            seen.add(path)
+            if len(popular) >= POPULAR_CACHE_MAX:
+                break
+    POPULAR_CACHE = popular
+    POPULAR_CACHE_LAST_BUILD = time.time()
+    POPULAR_CACHE_DIRTY = False
+
+
+def get_popular_videos(limit: int = 100) -> List[str]:
+    ensure_popular_cache()
+    if limit <= 0:
+        return POPULAR_CACHE[:]
+    return POPULAR_CACHE[:limit]
+
+
+def build_video_entry(full_path: str, lang: str) -> Optional[Dict]:
+    rel = normalize_rel_path(os.path.relpath(full_path, VIDEO_ROOT))
+    refresh_video_index()
+    base = VIDEO_INDEX.get(rel)
+    if base is None:
+        refresh_video_index(force=True)
+        base = VIDEO_INDEX.get(rel)
+        if base is None:
+            return None
+    return localized_video_entry(base, lang)
+
+
+def list_videos_in_dir(dir_abs: str, lang: str) -> List[Dict]:
+    refresh_video_index()
+    rel_dir = normalize_rel_path(os.path.relpath(dir_abs, VIDEO_ROOT))
+    results: List[Dict] = []
+    # copy values to avoid "dictionary changed size" errors if the index refreshes mid-iteration
+    for base in list(VIDEO_INDEX.values()):
+        if base.get("directory", "") != rel_dir:
+            continue
+        results.append(localized_video_entry(base, lang))
+    results.sort(key=lambda x: x["display"].lower())
+    return results
+
+
+def list_all_videos(lang: str) -> List[Dict]:
+    refresh_video_index()
+    # iterate over a snapshot so background refreshes do not mutate the dict during iteration
+    return [localized_video_entry(base, lang) for base in list(VIDEO_INDEX.values())]
+
+
+def list_short_videos(lang: str) -> List[Dict]:
+    refresh_video_index()
+    shorts: List[Dict] = []
+    max_duration = SHORTS_MAX_DURATION if SHORTS_MAX_DURATION > 0 else None
+    for base in list(VIDEO_INDEX.values()):
+        path = base.get("path") or ""
+        if path and not has_video_access(path):
+            continue
+        duration_seconds = float(base.get("duration_seconds") or 0.0)
+        if duration_seconds <= 0.0:
+            continue
+        if max_duration is not None and duration_seconds > max_duration:
+            continue
+        shorts.append(localized_video_entry(base, lang))
+    return shorts
+
+
+def attach_secure_urls(videos: List[Dict]):
+    for v in videos:
+        sc = get_protected_root_for(v["path"])
+        v["watch_url"] = with_grant(url_for('watch_video', filepath=v['path']), sc)
+        v["thumb_url"] = with_grant(url_for('serve_file', filepath=v['thumb']), sc if sc else None)
+        v["preview_url"] = with_grant(url_for('preview_file', filepath=v['path']), sc if sc else None)
+
+
+def hydrate_short_entries(entries: List[Dict]) -> None:
+    if not entries:
+        return
+    attach_secure_urls(entries)
+    for item in entries:
+        scope = get_protected_root_for(item["path"])
+        item["file_url"] = with_grant(url_for('serve_file', filepath=item['path']), scope)
+        if not item.get("thumb_url"):
+            item["thumb_url"] = with_grant(
+                url_for('serve_file', filepath=item['thumb']), scope if scope else None
+            )
+        item["subscribed"] = is_author_subscribed(item.get("author"))
+        item["user_reaction"] = user_reaction_for(item["path"]) if g.user else None
+
+
+def serialize_short_entry(item: Dict) -> Dict:
+    author = item.get("author")
+    normalized_author = normalize_author_name(author)
+    return {
+        "path": item.get("path"),
+        "display": item.get("display"),
+        "author": author,
+        "author_key": (normalized_author.lower() if normalized_author else ""),
+        "duration": item.get("duration"),
+        "duration_seconds": float(item.get("duration_seconds") or 0.0),
+        "views": int(item.get("views", 0) or 0),
+        "likes": int(item.get("likes", 0) or 0),
+        "dislikes": int(item.get("dislikes", 0) or 0),
+        "favorites": int(item.get("favorites", 0) or 0),
+        "watch_url": item.get("watch_url"),
+        "file_url": item.get("file_url"),
+        "thumb_url": item.get("thumb_url"),
+        "preview_url": item.get("preview_url"),
+        "subscribed": bool(item.get("subscribed")),
+        "user_reaction": item.get("user_reaction"),
+        "mtime": item.get("mtime"),
+    }
+
+
+def collect_video_entries(paths: List[str], lang: str) -> List[Dict]:
+    refresh_video_index()
+    entries: List[Dict] = []
+    for path in paths:
+        base = VIDEO_INDEX.get(path)
+        if not base:
+            continue
+        if not has_video_access(path):
+            continue
+        entries.append(localized_video_entry(base, lang))
+    return entries
+
+
+def build_recommendation_pool(current_path: str, lang: str, current_author: Optional[str], current_dir_prefix: str, desired: int = 400) -> List[Dict]:
+    refresh_video_index()
+    candidate_paths: List[str] = []
+    seen: set = set()
+    sequence_scores = get_sequence_neighbors(current_path, limit=desired * 2)
+    walk_scores = walk_transition_scores(current_path, depth=3, branch=20, decay=0.83)
+    collab_watch_scores, collab_reaction_scores = get_collaborative_scores(current_path, limit=desired * 2)
+
+    def add_candidate(raw_path: str, *, allow_same_dir: bool = False) -> None:
+        normalized = normalize_rel_path(raw_path)
+        if not normalized or normalized == current_path or normalized in seen:
+            return
+        if normalized not in VIDEO_INDEX:
+            return
+        if not has_video_access(normalized):
+            return
+        if not allow_same_dir and current_dir_prefix and normalized.startswith(current_dir_prefix):
+            strongest_signal = max(
+                sequence_scores.get(normalized, 0.0),
+                walk_scores.get(normalized, 0.0),
+                collab_watch_scores.get(normalized, 0.0),
+                collab_reaction_scores.get(normalized, 0.0),
+            )
+            if strongest_signal <= 0.0:
+                return
+        candidate_paths.append(normalized)
+        seen.add(normalized)
+
+    for path, _ in sorted(sequence_scores.items(), key=lambda item: item[1], reverse=True):
+        add_candidate(path, allow_same_dir=True)
+        if len(candidate_paths) >= desired:
+            break
+
+    if len(candidate_paths) < desired:
+        for path, _ in sorted(walk_scores.items(), key=lambda item: item[1], reverse=True):
+            if _ <= 0.0:
+                continue
+            add_candidate(path)
+            if len(candidate_paths) >= desired:
+                break
+
+    if len(candidate_paths) < desired:
+        for path, _ in sorted(collab_watch_scores.items(), key=lambda item: item[1], reverse=True):
+            if _ <= 0.0:
+                continue
+            add_candidate(path, allow_same_dir=True)
+            if len(candidate_paths) >= desired:
+                break
+
+    if len(candidate_paths) < desired:
+        for path, _ in sorted(collab_reaction_scores.items(), key=lambda item: item[1], reverse=True):
+            if _ <= 0.0:
+                continue
+            add_candidate(path, allow_same_dir=True)
+            if len(candidate_paths) >= desired:
+                break
+
+    if len(candidate_paths) < desired:
+        subscriptions = user_subscriptions_set()
+        if subscriptions:
+            for author in subscriptions:
+                for path in AUTHOR_VIDEO_INDEX.get(author, [])[:desired]:
+                    add_candidate(path, allow_same_dir=True)
+                    if len(candidate_paths) >= desired:
+                        break
+                if len(candidate_paths) >= desired:
+                    break
+
+    if len(candidate_paths) < desired and current_author:
+        for path in AUTHOR_VIDEO_INDEX.get(current_author, []):
+            add_candidate(path)
+            if len(candidate_paths) >= desired:
+                break
+
+    if len(candidate_paths) < desired:
+        for path in get_popular_videos(desired * 2):
+            add_candidate(path)
+            if len(candidate_paths) >= desired:
+                break
+
+    if len(candidate_paths) < desired:
+        for path in list(VIDEO_INDEX.keys()):
+            add_candidate(path)
+            if len(candidate_paths) >= desired:
+                break
+
+    if len(candidate_paths) < desired:
+        for path in list(VIDEO_INDEX.keys()):
+            add_candidate(path, allow_same_dir=True)
+            if len(candidate_paths) >= desired:
+                break
+
+    entries = collect_video_entries(candidate_paths, lang)
+    enrich_cards_with_stats(entries, include_favorites=True)
+    for entry in entries:
+        entry["_sequence_weight"] = sequence_scores.get(entry["path"], 0.0)
+        entry["_walk_weight"] = walk_scores.get(entry["path"], 0.0)
+        entry["_collab_watch"] = collab_watch_scores.get(entry["path"], 0.0)
+        entry["_collab_react"] = collab_reaction_scores.get(entry["path"], 0.0)
+    return entries
+
+
+def compute_recommendation_score(
+    entry: Dict,
+    current_author: Optional[str],
+    current_dir_prefix: str,
+    author_weights: Optional[Dict[str, float]] = None,
+    watched_paths: Optional[Set[str]] = None,
+    now_ts: Optional[float] = None,
+    max_sequence_weight: float = 0.0,
+    max_collab_watch: float = 0.0,
+    max_collab_react: float = 0.0,
+    max_walk_weight: float = 0.0,
+    duration_pref: Optional[float] = None,
+) -> float:
+    score = 0.0
+    score += entry.get("views", 0) * 0.08
+    score += entry.get("likes", 0) * 2.8
+    score -= entry.get("dislikes", 0) * 1.5
+    score += entry.get("favorites", 0) * 4.5
+    seq_weight = float(entry.get("_sequence_weight") or 0.0)
+    if seq_weight > 0.0:
+        if max_sequence_weight > 0.0:
+            score += 120.0 * (seq_weight / max_sequence_weight)
+        else:
+            score += seq_weight * 12.0
+    walk_weight = float(entry.get("_walk_weight") or 0.0)
+    if walk_weight > 0.0:
+        if max_walk_weight > 0.0:
+            score += 110.0 * (walk_weight / max_walk_weight)
+        else:
+            score += walk_weight * 10.0
+    collab_watch = float(entry.get("_collab_watch") or 0.0)
+    if collab_watch > 0.0:
+        if max_collab_watch > 0.0:
+            score += 160.0 * (collab_watch / max_collab_watch)
+        else:
+            score += collab_watch * 12.0
+    elif collab_watch < 0.0 and max_collab_watch:
+        score += 80.0 * (collab_watch / max_collab_watch)
+    collab_react = float(entry.get("_collab_react") or 0.0)
+    if max_collab_react > 0.0:
+        score += 90.0 * (collab_react / max_collab_react)
+    elif max_collab_react < 0.0:
+        score += 90.0 * (collab_react / abs(max_collab_react))
+    else:
+        score += collab_react * 6.0
+    author = entry.get("author")
+    same_directory = bool(current_dir_prefix and entry["path"].startswith(current_dir_prefix))
+    if current_author and author == current_author:
+        score += 14.0 if (seq_weight > 0.0 or collab_watch > 0.0 or collab_react > 0.0) else 6.0
+    if same_directory:
+        if seq_weight > 0.0 or walk_weight > 0.0 or collab_watch > 0.0 or collab_react > 0.0:
+            score += 5.0
+        else:
+            score -= 22.0
+    else:
+        score += 6.0
+    weights = author_weights or {}
+    if author and author in weights:
+        score += weights[author] * 7.0
+    watched = watched_paths or set()
+    if entry["path"] in watched:
+        score -= 60.0
+    mtime = entry.get("mtime", 0.0) or 0.0
+    reference = now_ts or time.time()
+    if mtime:
+        age_days = max((reference - mtime) / 86400.0, 0.0)
+        score += max(0.0, 25.0 - age_days)
+    if duration_pref and duration_pref > 0.0:
+        duration_seconds = float(entry.get("duration_seconds") or 0.0)
+        if duration_seconds > 0.0:
+            diff_minutes = abs(duration_seconds - duration_pref) / 60.0
+            score -= min(diff_minutes * 1.4, 22.0)
+        else:
+            score -= 3.0
+    score += random.random() * 0.35
+    return score
+
+
+def recommend_videos(current_path: str, videos: List[Dict], current_author: Optional[str], current_dir_prefix: str, limit: int = 6) -> List[Dict]:
+    scored: List[Tuple[float, Dict]] = []
+    author_weights = user_author_weights()
+    watched_paths = user_watched_paths()
+    reference_ts = time.time()
+    max_sequence_weight = 0.0
+    max_collab_watch = 0.0
+    max_collab_react = 0.0
+    max_walk_weight = 0.0
+    duration_pref = user_duration_preference()
+    for entry in videos:
+        if entry["path"] == current_path:
+            continue
+        seq_weight = float(entry.get("_sequence_weight") or 0.0)
+        if seq_weight > max_sequence_weight:
+            max_sequence_weight = seq_weight
+        watch_signal = float(entry.get("_collab_watch") or 0.0)
+        if watch_signal > max_collab_watch:
+            max_collab_watch = watch_signal
+        reaction_signal = abs(float(entry.get("_collab_react") or 0.0))
+        if reaction_signal > max_collab_react:
+            max_collab_react = reaction_signal
+        walk_signal = float(entry.get("_walk_weight") or 0.0)
+        if walk_signal > max_walk_weight:
+            max_walk_weight = walk_signal
+    for entry in videos:
+        if entry["path"] == current_path:
+            continue
+        entry_copy = dict(entry)
+        scored.append((
+            compute_recommendation_score(
+                entry_copy,
+                current_author,
+                current_dir_prefix,
+                author_weights,
+                watched_paths,
+                reference_ts,
+                max_sequence_weight,
+                max_collab_watch,
+                max_collab_react,
+                max_walk_weight,
+                duration_pref,
+            ),
+            entry_copy,
+        ))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in scored[:limit]]
+
+
+def list_all_top_dirs() -> List[str]:
+    out = []
+    for name in os.listdir(VIDEO_ROOT):
+        full = os.path.join(VIDEO_ROOT, name)
+        if os.path.isdir(full) and not name.startswith("__") and os.path.abspath(full) != os.path.abspath(PREVIEW_ROOT):
+            out.append(name)
+    return sorted(out, key=str.lower)
+
+
+def breadcrumbs_for(subpath: str) -> List[Dict[str, str]]:
+    crumbs = []
+    if not subpath: return crumbs
+    parts = subpath.split("/")
+    for i in range(len(parts)):
+        p = "/".join(parts[:i+1])
+        crumbs.append({"name": parts[i], "path": p})
+    return crumbs
+
+
+# -------------------------
+# Quality helpers (ladder)
+# -------------------------
+COMMON_HEIGHTS = [2160, 1440, 1080, 1024, 960, 900, 864, 846, 810, 768, 720, 704, 576, 540, 480, 432, 404, 360, 288, 240, 180]
+
+
+def available_heights_for(video_path: str) -> List[int]:
+    w,h = probe_video_size(video_path)
+    # отдаём только те высоты, что не больше источника, и не меньше 180
+    hs = [x for x in COMMON_HEIGHTS if 180 <= x <= h]
+    # гарантируем включение «почти исходной» высоты, даже если нестандартная (например 854)
+    if 180 <= h and h not in hs:
+        hs = sorted(set(hs + [h]), reverse=True)
+    return hs
+
+
+def ffmpeg_stream_cmd(input_path: str, height: int) -> List[str]:
+    # Для совместимости: H.264 + AAC, фрагментированный MP4
+    vf = f"scale=-2:{height}:flags=bicubic"
+    return [
+        "ffmpeg","-hide_banner","-loglevel","error","-nostdin",
+        "-reconnect","1","-reconnect_streamed","1","-reconnect_on_network_error","1",
+        "-i", input_path,
+        "-vf", vf, "-pix_fmt","yuv420p",
+        "-c:v","libx264","-preset","veryfast","-crf","22",
+        "-c:a","aac","-b:a","160k",
+        "-movflags","+frag_keyframe+empty_moov+faststart",
+        "-f","mp4","pipe:1"
+    ]
+
+
+# -------------------------
+# Player mode (always custom improved)
+# -------------------------
+def get_player_mode():
+    return "custom"
+
+
+# -------------------------
+# Helpers for reactions / favorites
+# -------------------------
+def refresh_reaction_cache_for(paths: List[str]) -> None:
+    unique = [p for p in dict.fromkeys(paths) if p]
+    if not unique:
+        return
+    db = get_db()
+    for chunk in chunked_list(unique, SQLITE_MAX_VARIABLES):
+        if not chunk:
+            continue
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = db.execute(
+            f"""
+            SELECT video_path,
+                   SUM(CASE WHEN reaction='like' THEN 1 ELSE 0 END) AS likes,
+                   SUM(CASE WHEN reaction='dislike' THEN 1 ELSE 0 END) AS dislikes
+            FROM reactions
+            WHERE video_path IN ({placeholders})
+            GROUP BY video_path
+            """,
+            chunk
+        ).fetchall()
+        defaults = {path: {"likes": 0, "dislikes": 0} for path in chunk}
+        REACTION_CACHE.update(defaults)
+        for row in rows:
+            REACTION_CACHE[row["video_path"]] = {
+                "likes": row["likes"] or 0,
+                "dislikes": row["dislikes"] or 0,
+            }
+
+
+def refresh_favorite_cache_for(paths: List[str]) -> None:
+    unique = [p for p in dict.fromkeys(paths) if p]
+    if not unique:
+        return
+    db = get_db()
+    for chunk in chunked_list(unique, SQLITE_MAX_VARIABLES):
+        if not chunk:
+            continue
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = db.execute(
+            f"""
+            SELECT video_path, COUNT(*) AS cnt
+            FROM favorites
+            WHERE video_path IN ({placeholders})
+            GROUP BY video_path
+            """,
+            chunk
+        ).fetchall()
+        defaults = {path: 0 for path in chunk}
+        FAVORITE_CACHE.update(defaults)
+        for row in rows:
+            FAVORITE_CACHE[row["video_path"]] = row["cnt"] or 0
+
+
+def reaction_counts(paths: List[str]) -> Dict[str, Dict[str, int]]:
+    res = {p: {"likes": 0, "dislikes": 0} for p in paths}
+    if not paths:
+        return res
+    unique_paths = list(dict.fromkeys(paths))
+    missing = [p for p in unique_paths if p not in REACTION_CACHE]
+    if missing:
+        refresh_reaction_cache_for(missing)
+    for p in paths:
+        res[p] = REACTION_CACHE.get(p, {"likes": 0, "dislikes": 0})
+    return res
+
+
+def favorite_counts(paths: List[str]) -> Dict[str, int]:
+    res = {p: 0 for p in paths}
+    if not paths:
+        return res
+    unique_paths = list(dict.fromkeys(paths))
+    missing = [p for p in unique_paths if p not in FAVORITE_CACHE]
+    if missing:
+        refresh_favorite_cache_for(missing)
+    for p in paths:
+        res[p] = FAVORITE_CACHE.get(p, 0)
+    return res
+
+
+def user_watched_paths() -> Set[str]:
+    user = getattr(g, "user", None)
+    if user is None:
+        return set()
+    cached = getattr(g, "_watched_paths", None)
+    if cached is not None:
+        return cached
+    db = get_db()
+    rows = db.execute(
+        "SELECT video_path FROM view_events WHERE user_id = ?",
+        (user["id"],),
+    ).fetchall()
+    watched = {normalize_rel_path(row["video_path"]) for row in rows if row["video_path"]}
+    g._watched_paths = watched
+    return watched
+
+
+def normalize_author_name(author: Optional[str]) -> Optional[str]:
+    if author is None:
+        return None
+    normalized = author.strip()
+    return normalized or None
+
+
+def user_subscriptions_set() -> Set[str]:
+    user = getattr(g, "user", None)
+    if user is None:
+        return set()
+    cached = getattr(g, "_author_subscriptions", None)
+    if cached is not None:
+        return cached
+    db = get_db()
+    rows = db.execute(
+        "SELECT author FROM author_subscriptions WHERE user_id = ?",
+        (user["id"],),
+    ).fetchall()
+    subs = {row["author"] for row in rows if row["author"]}
+    g._author_subscriptions = subs
+    return subs
+
+
+def is_author_subscribed(author: Optional[str]) -> bool:
+    normalized = normalize_author_name(author)
+    if not normalized:
+        return False
+    return normalized in user_subscriptions_set()
+
+
+def user_author_weights() -> Dict[str, float]:
+    user = getattr(g, "user", None)
+    if user is None:
+        return {}
+    cached = getattr(g, "_author_weights", None)
+    if cached is not None:
+        return cached
+    refresh_video_index()
+    weights: Dict[str, float] = {}
+    db = get_db()
+    rows = db.execute(
+        "SELECT video_path, reaction FROM reactions WHERE user_id = ?",
+        (user["id"],),
+    ).fetchall()
+    for row in rows:
+        normalized = normalize_rel_path(row["video_path"])
+        base = VIDEO_INDEX.get(normalized)
+        author = base.get("author") if base else extract_author(normalized)
+        if not author:
+            continue
+        delta = 2.0 if row["reaction"] == "like" else -1.0
+        weights[author] = weights.get(author, 0.0) + delta
+    fav_rows = db.execute(
+        "SELECT video_path FROM favorites WHERE user_id = ?",
+        (user["id"],),
+    ).fetchall()
+    for row in fav_rows:
+        normalized = normalize_rel_path(row["video_path"])
+        base = VIDEO_INDEX.get(normalized)
+        author = base.get("author") if base else extract_author(normalized)
+        if not author:
+            continue
+        weights[author] = weights.get(author, 0.0) + 3.0
+    for author in user_subscriptions_set():
+        weights[author] = weights.get(author, 0.0) + 18.0
+    g._author_weights = weights
+    return weights
+
+
+def user_duration_preference() -> Optional[float]:
+    user = getattr(g, "user", None)
+    if user is None:
+        return None
+    cached = getattr(g, "_duration_pref", None)
+    if cached is not None:
+        return cached
+    db = get_db()
+    row = db.execute(
+        "SELECT seconds_watched, views_count FROM user_stats WHERE user_id = ?",
+        (user["id"],),
+    ).fetchone()
+    if row and row["views_count"]:
+        seconds = max(float(row["seconds_watched"] or 0.0), 0.0)
+        views = max(float(row["views_count"] or 0.0), 1.0)
+        avg = seconds / views
+        g._duration_pref = avg
+        return avg
+    g._duration_pref = None
+    return None
+
+
+def user_reaction_for(path: str) -> Optional[str]:
+    if g.user is None:
+        return None
+    db = get_db()
+    row = db.execute(
+        "SELECT reaction FROM reactions WHERE user_id = ? AND video_path = ?",
+        (g.user["id"], path)
+    ).fetchone()
+    return row["reaction"] if row else None
+
+
+def is_favorite(path: str) -> bool:
+    if g.user is None:
+        return False
+    db = get_db()
+    row = db.execute(
+        "SELECT 1 FROM favorites WHERE user_id = ? AND video_path = ?",
+        (g.user["id"], path)
+    ).fetchone()
+    return bool(row)
+
+
+def enrich_cards_with_stats(videos: List[Dict], include_favorites: bool = False):
+    paths = [v["path"] for v in videos]
+    counts = reaction_counts(paths)
+    favs = favorite_counts(paths) if include_favorites else {}
+    for v in videos:
+        path = v["path"]
+        c = counts.get(path, {"likes": 0, "dislikes": 0})
+        v["views"] = _views.get(path, 0)
+        v["likes"] = c.get("likes", 0)
+        v["dislikes"] = c.get("dislikes", 0)
+        if include_favorites:
+            v["favorites"] = favs.get(path, 0)
+
+# -------------------------
+# TEMPLATES
+# -------------------------
+TEMPLATE_ACCESS = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>🔒 {{ ui['locked'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:\"Inter\",\"Segoe UI\",Arial,sans-serif;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:#11151b;padding:26px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35);max-width:360px;width:100%}
+h2{margin:0 0 12px}
+input{width:100%;margin-top:10px;padding:10px;border-radius:10px;border:1px solid #2a3440;background:#151b23;color:#e6edf3}
+button{margin-top:12px;width:100%;background:#238636;color:#fff;border:0;padding:10px;border-radius:10px;cursor:pointer}
+button:hover{background:#2ea043}
+.msg{color:#ff6666;margin-top:8px}
+a{color:#58a6ff;text-decoration:none}
+</style>
+</head>
+<body>
+<div class=\"card\">
+  {% set sort_arg = sort_mode if sort_mode != 'name' else None %}
+  <h2>🔒 {{ path }}</h2>
+  <form method=\"post\">
+    <input type=\"hidden\" name=\"sort\" value=\"{{ sort_mode }}\">
+    <input type=\"password\" name=\"password\" placeholder=\"{{ ui['enter_pass'] }}\" required>
+    <button type=\"submit\">{{ ui['open'] }}</button>
+  </form>
+  {% if error %}<div class=\"msg\">{{ error }}</div>{% endif %}
+  <div style=\"margin-top:10px\"><a href=\"{{ url_for('browse', subpath='', sort=sort_arg) }}\">← {{ ui['back'] }}</a></div>
+</div>
+</body>
+</html>
+"""
+
+TEMPLATE_MAIN = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>🎬 {{ ui['title_main'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+:root{--bg:#0d1117;--card:#11151b;--card2:#151b23;--text:#e6edf3;--muted:#9aa4b2;--link:#58a6ff;--accent:#238636;--accent2:#2ea043;--shadow:0 10px 30px rgba(0,0,0,.35)}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:\"Inter\",\"Segoe UI\",Arial,sans-serif;margin:0}
+.container{max-width:100%;margin:auto;padding:30px 50px}
+.header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:18px}
+.breadcrumbs{font-size:14px;color:var(--muted)}
+.breadcrumbs a{color:var(--link);text-decoration:none}
+h1{margin:0;font-weight:800;font-size:22px}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.input{background:#151b23;border:1px solid #242c37;color:var(--text);padding:11px 14px;border-radius:12px;min-width:280px;outline:none;box-shadow:var(--shadow)}
+.button{background:var(--accent);color:#fff;border:0;padding:11px 14px;border-radius:12px;text-decoration:none;display:inline-flex;gap:8px;align-items:center;box-shadow:var(--shadow);transition:.25s}
+.button:hover{background:var(--accent2);transform:scale(1.03)}
+.lang{background:#30363d}
+.logout-btn{background:#dc3545}
+.logout-btn:hover{background:#ff4757}
+.user-badge{display:inline-flex;align-items:center;gap:6px;padding:10px 12px;border-radius:12px;background:#1c2129;color:var(--text);font-weight:600;box-shadow:var(--shadow)}
+.section-title{margin:18px 0 10px;font-size:18px;font-weight:800}
+.section-header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:18px 0 10px}
+.section-header .section-title{margin:0}
+.sort-form{display:flex;align-items:center;gap:8px}
+.sort-form label{font-size:13px;color:var(--muted)}
+.sort-select{background:#151b23;border:1px solid #242c37;color:var(--text);padding:8px 12px;border-radius:12px;cursor:pointer;box-shadow:var(--shadow)}
+.grid{display:grid;gap:22px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+.card{background:var(--card);border-radius:16px;overflow:hidden;transition:.25s;box-shadow:var(--shadow)}
+.card:hover{transform:scale(1.02);background:var(--card2)}
+.thumb-wrap{position:relative}
+.thumb, video.thumb{width:100%;aspect-ratio:16/9;object-fit:cover;display:block;border-radius:12px;background:#000}
+.dur{position:absolute;right:10px;bottom:10px;background:rgba(0,0,0,.7);color:#fff;padding:2px 6px;border-radius:8px;font-size:12px}
+.meta{display:flex;justify-content:center;gap:14px;margin:6px 0 2px;color:#9aa4b2;font-size:12px}
+.meta span.author{white-space:nowrap}
+.title{padding:6px 12px 12px;font-size:15px;text-align:center;font-weight:600;color:var(--text);min-height:46px;display:flex;align-items:center;justify-content:center}
+.muted{color:var(--muted)}
+.lock{font-size:12px;color:#9aa4b2;margin-left:6px}
+.hidden{display:none!important}
+@media(max-width:900px){.container{padding:20px}.grid{gap:16px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.section-header{flex-direction:column;align-items:flex-start;gap:12px}.sort-form{width:100%}.sort-select{width:100%}}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:10px 12px;border-radius:12px;background:#1c2129;color:var(--muted)}
+</style>
+
+<script>
+let aborter=null;
+function currentSortValue(){
+  const select=document.getElementById('sortSelect');
+  return select?select.value:'name';
+}
+async function doSearch(q){
+  const sectionCats=document.getElementById('section-cats');
+  const gridVids=document.getElementById('grid-vids');
+  if(!q){
+    sectionCats.classList.remove('hidden');
+    gridVids.innerHTML=window.__initialVideosHTML||gridVids.innerHTML;
+    setupPreviews();
+    return;
+  }
+  sectionCats.classList.add('hidden');
+  try{
+    if(aborter) aborter.abort();
+    aborter=new AbortController();
+    const sort=currentSortValue();
+    const res=await fetch('/api/search?q='+encodeURIComponent(q)+'&sort='+encodeURIComponent(sort),{signal:aborter.signal});
+    const data=await res.json();
+    gridVids.innerHTML=(data.results||[]).map(v=>`
+      <div class=\"card\">
+        <a href=\"/watch/${v.path}\">
+          <div class=\"thumb-wrap\">
+            <video class=\"thumb hovervid\" muted playsinline preload=\"none\"
+                   poster=\"/files/${v.thumb}\" data-preview=\"/preview/${v.path}\"></video>
+            <div class=\"dur\">${v.duration||''}</div>
+          </div>
+          <div class=\"meta\">
+            <span>👁 ${v.views||0}</span>
+            <span>👍 ${v.likes||0}</span>
+            <span>👎 ${v.dislikes||0}</span>
+            <span class=\"author\">👤 ${v.author||'—'}</span>
+          </div>
+          <div class=\"title\">${v.display||v.name}</div>
+        </a>
+      </div>`).join('') || '<p class=\"muted\">{{ ui["nothing_found"] }}</p>';
+    setupPreviews();
+  }catch(e){}
+}
+function setupPreviews(){
+  const isTouch=('ontouchstart' in window)||(navigator.maxTouchPoints>0);
+  const vids=document.querySelectorAll('video.hovervid');
+  if(!isTouch){
+    vids.forEach(v=>{
+      v.addEventListener('mouseenter',()=>{ if(!v.src){v.src=v.dataset.preview;} v.currentTime=0; v.play().catch(()=>{}); });
+      v.addEventListener('mouseleave',()=>{ v.pause(); v.removeAttribute('src'); v.load(); });
+    });
+  }else{
+    const io=new IntersectionObserver((entries)=>{
+      entries.forEach(entry=>{
+        const v=entry.target;
+        if(entry.isIntersecting && entry.intersectionRatio>0.6){
+          if(!v.src){ v.src=v.dataset.preview; }
+          v.currentTime=0; v.play().catch(()=>{});
+        }else{
+          v.pause(); v.removeAttribute('src'); v.load();
+        }
+      });
+    },{threshold:[0,0.25,0.6,1]});
+    vids.forEach(v=>io.observe(v));
+  }
+}
+document.addEventListener('DOMContentLoaded',()=>{
+  const grid=document.getElementById('grid-vids');
+  window.__initialVideosHTML=grid?grid.innerHTML:'';
+  setupPreviews();
+});
+</script>
+</head>
+<body>
+<div class=\"container\">
+  {% set sort_arg = sort_mode if sort_mode != 'name' else None %}
+  <div class=\"header\">
+    <div>
+      <div class=\"breadcrumbs\">
+        {% if crumbs %}
+          {% for c in crumbs %}
+            {% if not loop.last %}
+              <a href=\"{{ url_for('browse', subpath=c.path, sort=sort_arg) }}\">{{ c.name }}</a> /
+            {% else %}
+              <span class=\"muted\">{{ c.name }}</span>
+            {% endif %}
+          {% endfor %}
+        {% else %}
+          <span class=\"muted\">{{ ui['root'] }}</span>
+        {% endif %}
+      </div>
+      <h1>{{ title }}</h1>
+    </div>
+    <div class=\"toolbar\">
+      <input class=\"input\" placeholder=\"{{ ui['search_placeholder'] }}\" oninput=\"doSearch(this.value)\">
+      <a class=\"button\" href=\"{{ url_for('random_video') }}\">🎲 {{ ui['random'] }}</a>
+      <a class=\"button\" href=\"{{ url_for('random_settings') }}\">🎛 {{ ui['random_settings'] }}</a>
+      <a class=\"button\" href=\"{{ url_for('shorts_page') }}\">🎞 {{ ui['shorts'] }}</a>
+      {% if current_user %}
+        <span class=\"user-badge\">👤 {{ current_user['username'] }}</span>
+        <a class=\"button\" href=\"{{ url_for('upload_video') }}\">⬆️ {{ ui['upload'] }}</a>
+        <a class=\"button\" href=\"{{ url_for('account_stats') }}\">📊 {{ ui['account_stats'] }}</a>
+        <a class=\"button\" href=\"{{ url_for('favorites_page') }}\">❤️ {{ ui['favorites'] }}</a>
+        {% if current_user['is_admin'] %}
+          <a class=\"button\" href=\"{{ url_for('admin_panel') }}\">🛠 {{ ui['admin_panel'] }}</a>
+          <a class=\"button\" href=\"{{ url_for('moderator_panel') }}\">🛡 {{ ui['moderator_panel'] }}</a>
+        {% elif current_user['is_moderator'] %}
+          <a class=\"button\" href=\"{{ url_for('moderator_panel') }}\">🛡 {{ ui['moderator_panel'] }}</a>
+        {% endif %}
+        <a class=\"button logout-btn\" href=\"{{ url_for('logout') }}\">🚪 {{ ui['logout'] }}</a>
+      {% else %}
+        <a class=\"button\" href=\"{{ url_for('login') }}\">🔑 {{ ui['login'] }}</a>
+        <a class=\"button\" href=\"{{ url_for('register') }}\">🆕 {{ ui['register'] }}</a>
+      {% endif %}
+      <a class=\"button lang\" href=\"{{ url_for('set_lang', code=('en' if lang=='ru' else 'ru')) }}\">{{ ui['lang_btn'] }}</a>
+    </div>
+  </div>
+
+  <div id=\"section-cats\">
+    {% if subfolders %}
+      <div class=\"section-title\">{{ ui['categories'] }}</div>
+      <div class=\"grid\">
+        {% for folder in subfolders %}
+          <div class=\"card\">
+            {% if folder['raw_path'] in protected and not is_admin %}
+              <a href=\"{{ url_for('access_folder', subpath=folder['raw_path'], sort=sort_arg) }}\">
+                <div class=\"title\">{{ folder['name'] }} <span class=\"lock\">({{ ui['locked'] }})</span></div>
+              </a>
+            {% else %}
+              <a href=\"{{ url_for('browse', subpath=folder['raw_path'], sort=sort_arg) }}\">
+                <div class=\"title\">{{ folder['name'] }}</div>
+              </a>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+
+  <div class=\"section-header\">
+    <div class=\"section-title\">{{ ui['videos'] }}</div>
+    <form class=\"sort-form\" method=\"get\" action=\"{{ url_for('browse', subpath=current_path) }}\">
+      <label for=\"sortSelect\">{{ ui['sort_by'] }}:</label>
+      <select id=\"sortSelect\" name=\"sort\" class=\"sort-select\" onchange=\"this.form.submit()\">
+        {% for key, label in sort_options %}
+          <option value=\"{{ key }}\" {% if sort_mode == key %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </form>
+  </div>
+  <div id=\"grid-vids\" class=\"grid\">
+    {% if videos %}
+      {% for v in videos %}
+        <div class=\"card\">
+          <a href=\"{{ url_for('watch_video', filepath=v['path']) }}\">
+            <div class=\"thumb-wrap\">
+              <video class=\"thumb hovervid\" muted playsinline preload=\"none\"
+                     poster=\"{{ url_for('serve_file', filepath=v['thumb']) }}\"
+                     data-preview=\"{{ url_for('preview_file', filepath=v['path']) }}\"></video>
+              <div class=\"dur\">{{ v['duration'] }}</div>
+            </div>
+            <div class=\"meta\">
+              <span>👁 {{ v.get('views', 0) }}</span>
+              <span>👍 {{ v.get('likes', 0) }}</span>
+              <span>👎 {{ v.get('dislikes', 0) }}</span>
+              <span class=\"author\">👤 {{ v.get('author') or '—' }}</span>
+            </div>
+            <div class=\"title\">{{ v['display'] }}</div>
+          </a>
+        </div>
+      {% endfor %}
+    {% else %}
+      <p class=\"muted\">{{ ui['not_found'] }}</p>
+    {% endif %}
+  </div>
+</div>
+</body>
+</html>
+"""
+
+TEMPLATE_SHORTS = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>🎞 {{ ui['shorts'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+:root{--bg:#0d1117;--card:#11151b;--text:#e6edf3;--muted:#9aa4b2;--accent:#238636;--accent2:#2ea043;--shadow:0 20px 50px rgba(0,0,0,.45);}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:"Inter","Segoe UI",Arial,sans-serif;overflow:hidden;}
+.hidden{display:none!important}
+.container{max-width:1180px;margin:auto;padding:20px 28px;}
+.header{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;justify-content:space-between;}
+.header h1{margin:0;font-size:26px;font-weight:800;}
+.hint{color:var(--muted);font-size:13px;margin-top:6px;max-width:360px;}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;}
+.button{background:var(--accent);color:#fff;border:0;padding:10px 14px;border-radius:12px;text-decoration:none;display:inline-flex;gap:8px;align-items:center;box-shadow:var(--shadow);transition:.25s;}
+.button:hover{background:var(--accent2);transform:scale(1.03);}
+.logout-btn{background:#dc3545;}
+.logout-btn:hover{background:#ff4757;}
+.user-chip{display:inline-flex;align-items:center;gap:6px;padding:10px 12px;border-radius:12px;background:#1c2129;color:#fff;font-weight:600;box-shadow:var(--shadow);}
+.sort-form{display:flex;align-items:center;gap:8px;}
+.sort-form label{color:var(--muted);font-size:13px;}
+.sort-select{background:#151b23;border:1px solid #242c37;color:var(--text);padding:8px 12px;border-radius:12px;cursor:pointer;box-shadow:var(--shadow);}
+.stage{position:relative;width:min(100vw,430px);height:clamp(420px, calc(100vh - 220px), 820px);margin:12px auto 0;overflow-y:auto;scroll-snap-type:y mandatory;overscroll-behavior:contain;-ms-overflow-style:none;scrollbar-width:none;}
+.stage::-webkit-scrollbar{display:none;}
+.scroll-filler{width:100%;height:0;pointer-events:none;}
+.short-card{position:sticky;top:0;width:100%;height:100%;background:#000;border-radius:28px;overflow:hidden;box-shadow:0 28px 60px rgba(0,0,0,.55);}
+.short-video{width:100%;height:100%;object-fit:cover;background:#000;}
+.sound-toggle{position:absolute;top:16px;right:16px;background:rgba(0,0,0,.5);color:#fff;border:0;border-radius:50%;width:48px;height:48px;display:flex;align-items:center;justify-content:center;font-size:20px;cursor:pointer;transition:.2s;}
+.sound-toggle:hover{background:rgba(0,0,0,.7);}
+.sound-toggle.active{background:#238636;}
+.overlay-info{position:absolute;left:18px;bottom:18px;color:#fff;text-shadow:0 2px 10px rgba(0,0,0,.75);display:flex;flex-direction:column;gap:10px;max-width:70%;}
+.overlay-info .title{font-size:19px;font-weight:700;line-height:1.3;}
+.overlay-info .meta{font-size:13px;color:rgba(255,255,255,.85);}
+.overlay-controls{position:absolute;right:18px;bottom:18px;display:flex;flex-direction:column;align-items:center;gap:18px;}
+.overlay-button{background:rgba(0,0,0,.5);color:#fff;border:0;border-radius:22px;padding:12px 14px;min-width:72px;display:flex;flex-direction:column;align-items:center;gap:6px;font-size:13px;font-weight:600;cursor:pointer;transition:.2s;text-decoration:none;}
+.overlay-button:hover{background:rgba(0,0,0,.7);transform:translateY(-2px);}
+.overlay-button.active{background:#238636;}
+.overlay-button .count{font-size:16px;}
+.loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-weight:600;letter-spacing:4px;}
+.empty{color:var(--muted);font-size:16px;text-align:center;}
+.stage .empty{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:100%;pointer-events:none;}
+.nav-controls{display:flex;justify-content:center;align-items:center;gap:14px;margin:18px auto 28px;width:min(100vw,430px);}
+.nav-button{background:#222b35;color:#fff;border:0;border-radius:12px;padding:10px 18px;font-size:15px;cursor:pointer;transition:.2s;}
+.nav-button:hover{background:#2a3440;}
+.counter{color:var(--muted);min-width:90px;text-align:center;font-size:14px;}
+@media(max-width:900px){
+  .container{padding:16px 18px;}
+  .toolbar{justify-content:flex-start;}
+  .stage{width:94vw;height:clamp(360px, calc(100vh - 240px), 820px);}
+  .short-card{border-radius:24px;}
+  .overlay-controls{right:12px;bottom:14px;}
+  .overlay-info{left:14px;bottom:16px;}
+}
+</style>
+</head>
+<body>
+<div class="container header">
+  <div>
+    <h1>🎞 {{ ui['shorts'] }}</h1>
+    <div class="hint">{{ ui['shorts_hint'] }}</div>
+  </div>
+  <div class="toolbar">
+    <a class="button" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
+    <a class="button" href="{{ url_for('random_video') }}">🎲 {{ ui['random'] }}</a>
+    {% if current_user %}
+      <span class="user-chip">👤 {{ current_user['username'] }}</span>
+      <a class="button" href="{{ url_for('favorites_page') }}">❤️ {{ ui['favorites'] }}</a>
+      <a class="button logout-btn" href="{{ url_for('logout', next=request.full_path if request.query_string else request.path) }}">🚪 {{ ui['logout'] }}</a>
+    {% else %}
+      <a class="button" href="{{ url_for('login', next=request.full_path if request.query_string else request.path) }}">🔑 {{ ui['login'] }}</a>
+      <a class="button" href="{{ url_for('register', next=request.full_path if request.query_string else request.path) }}">🆕 {{ ui['register'] }}</a>
+    {% endif %}
+    <form class="sort-form" method="get" action="{{ url_for('shorts_page') }}">
+      <label for="shortSort">{{ ui['sort_by'] }}</label>
+      <select id="shortSort" name="sort" class="sort-select" onchange="this.form.submit()">
+        {% for key, label in sort_options %}
+          <option value="{{ key }}" {% if sort_mode == key %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </form>
+  </div>
+</div>
+<div class="stage" id="shortStage">
+  <div id="shortCard" class="short-card hidden">
+    <video id="shortPlayer" class="short-video" playsinline webkit-playsinline loop muted preload="none" controlslist="nodownload noplaybackrate noremoteplayback"></video>
+    <button id="soundToggle" class="sound-toggle" title="{{ ui['sound_on'] }}">🔇</button>
+    <div class="overlay-info">
+      <div class="title" id="shortTitle"></div>
+      <div class="meta" id="shortMeta"></div>
+    </div>
+    <div class="overlay-controls">
+      <button id="likeButton" class="overlay-button" type="button">
+        <span>👍 {{ ui['like'] }}</span>
+        <span class="count" id="likeCount">0</span>
+      </button>
+      <button id="subscribeButton" class="overlay-button hidden" type="button">
+        <span id="subscribeLabel">{{ ui['subscribe'] }}</span>
+        <span class="count" id="subscribeAuthor">—</span>
+      </button>
+      <a id="openButton" class="overlay-button" href="#" target="_blank" rel="noopener">
+        <span>▶️</span>
+        <span>{{ ui['open_short'] }}</span>
+      </a>
+    </div>
+    <div id="shortLoading" class="loading hidden">•••</div>
+  </div>
+  <div id="shortEmpty" class="empty hidden">{{ ui['shorts_empty'] }}</div>
+  <div id="scrollFiller" class="scroll-filler"></div>
+</div>
+<div class="nav-controls">
+  <button id="prevShort" class="nav-button" type="button" title="{{ ui['prev_short'] }}">⬆️ {{ ui['prev_short'] }}</button>
+  <div class="counter" id="shortCounter">0 / 0</div>
+  <button id="nextShort" class="nav-button" type="button" title="{{ ui['next_short'] }}">{{ ui['next_short'] }} ⬇️</button>
+</div>
+<script>
+(function(){
+  const isAuth = {{ 'true' if current_user else 'false' }};
+  const loginUrl = {{ url_for('login', next=request.full_path if request.query_string else request.path)|tojson }};
+  const registerUrl = {{ url_for('register', next=request.full_path if request.query_string else request.path)|tojson }};
+  const stateUrl = {{ url_for('api_state')|tojson }};
+  const likeUrl = {{ url_for('api_like')|tojson }};
+  const subscribeUrl = {{ url_for('api_subscribe_author')|tojson }};
+  const unsubscribeUrl = {{ url_for('api_unsubscribe_author')|tojson }};
+  const feedUrl = {{ url_for('api_shorts_feed')|tojson }};
+  const viewUrl = {{ url_for('api_short_view')|tojson }};
+  const sortMode = {{ sort_mode|tojson }};
+  const batchSize = {{ shorts_batch }};
+  let total = {{ total_shorts }};
+  const strings = {
+    subscribe: {{ ui['subscribe']|tojson }},
+    subscribed: {{ ui['subscribed']|tojson }},
+    unsubscribe: {{ ui['unsubscribe']|tojson }},
+    soundOn: {{ ui['sound_on']|tojson }},
+    soundOff: {{ ui['sound_off']|tojson }}
+  };
+  const initialData = {{ initial_shorts|tojson }};
+  let feed = Array.isArray(initialData) ? initialData.slice() : [];
+  let index = 0;
+  let soundEnabled = false;
+  let loadingMore = false;
+  let userPaused = false;
+  let viewTimeout = null;
+  let lastNav = 0;
+  let scrollLock = false;
+  let scrollSnapTimer = null;
+  const preloaded = new Map();
+  const stateCache = new Map();
+  const viewedPaths = new Set();
+
+  const stage = document.getElementById('shortStage');
+  const scrollFiller = document.getElementById('scrollFiller');
+  const card = document.getElementById('shortCard');
+  const empty = document.getElementById('shortEmpty');
+  const player = document.getElementById('shortPlayer');
+  const loading = document.getElementById('shortLoading');
+  const titleEl = document.getElementById('shortTitle');
+  const metaEl = document.getElementById('shortMeta');
+  const likeBtn = document.getElementById('likeButton');
+  const likeCountEl = document.getElementById('likeCount');
+  const subscribeBtn = document.getElementById('subscribeButton');
+  const subscribeLabel = document.getElementById('subscribeLabel');
+  const subscribeAuthorEl = document.getElementById('subscribeAuthor');
+  const openBtn = document.getElementById('openButton');
+  const prevBtn = document.getElementById('prevShort');
+  const nextBtn = document.getElementById('nextShort');
+  const counterEl = document.getElementById('shortCounter');
+  const soundToggle = document.getElementById('soundToggle');
+
+  function clampIndexValue(value){
+    if(!feed.length){
+      return 0;
+    }
+    if(value < 0){ return 0; }
+    if(value >= feed.length){ return feed.length - 1; }
+    return value;
+  }
+
+  function clampIndex(){
+    index = clampIndexValue(index);
+  }
+
+  function stageHeight(){
+    return stage.getBoundingClientRect().height || stage.clientHeight || window.innerHeight || 1;
+  }
+
+  function updateScrollFiller(){
+    const height = stageHeight();
+    if(!height){
+      scrollFiller.style.height = '0px';
+      return;
+    }
+    const count = Math.max(feed.length, 1);
+    const fillerHeight = Math.max(count - 1, 0) * height;
+    scrollFiller.style.height = fillerHeight + 'px';
+  }
+
+  function scrollToCurrent(immediate){
+    if(scrollSnapTimer){
+      clearTimeout(scrollSnapTimer);
+      scrollSnapTimer = null;
+    }
+    if(!feed.length){
+      scrollLock = false;
+      return;
+    }
+    const height = stageHeight();
+    if(!height){
+      return;
+    }
+    const top = index * height;
+    scrollLock = true;
+    if(typeof stage.scrollTo === 'function'){
+      stage.scrollTo({top, behavior: immediate ? 'auto' : 'smooth'});
+      if(immediate){
+        scrollLock = false;
+      }else{
+        setTimeout(()=>{scrollLock = false;}, 320);
+      }
+    }else{
+      stage.scrollTop = top;
+      scrollLock = false;
+    }
+  }
+
+  function setIndex(target, options){
+    options = options || {};
+    if(!feed.length){
+      index = 0;
+      render();
+      return;
+    }
+    const clamped = clampIndexValue(target);
+    const changed = clamped !== index;
+    index = clamped;
+    if(changed || options.force){
+      render();
+    }
+    if(options.scroll){
+      scrollToCurrent(Boolean(options.immediate));
+    }
+  }
+
+  function currentItem(){
+    if(!feed.length){
+      return null;
+    }
+    clampIndex();
+    return feed[index] || null;
+  }
+
+  function formatCount(val){
+    const num = Number(val) || 0;
+    const abs = Math.abs(num);
+    if(abs >= 1e6){
+      const scaled = (num / 1e6).toFixed(abs >= 1e7 ? 0 : 1);
+      return scaled.replace(/\.0$/, '') + 'M';
+    }
+    if(abs >= 1e3){
+      const scaled = (num / 1e3).toFixed(abs >= 1e4 ? 0 : 1);
+      return scaled.replace(/\.0$/, '') + 'K';
+    }
+    return String(num);
+  }
+
+  function buildMeta(item){
+    if(!item){
+      return '';
+    }
+    const parts = [];
+    if(item.author){
+      parts.push('👤 ' + item.author);
+    }
+    const viewsVal = typeof item.views === 'number' ? item.views : Number(item.views) || 0;
+    parts.push('👁 ' + formatCount(viewsVal));
+    if(item.duration){
+      parts.push('⏱ ' + item.duration);
+    }
+    return parts.join(' • ');
+  }
+
+  function updateCounter(){
+    const totalDisplay = Math.max(total || 0, feed.length || 0);
+    if(!feed.length){
+      counterEl.textContent = '0 / ' + totalDisplay;
+    } else {
+      counterEl.textContent = (index + 1) + ' / ' + totalDisplay;
+    }
+  }
+
+  function showLoading(flag){
+    loading.classList.toggle('hidden', !flag);
+  }
+
+  function updateLikeState(item){
+    likeCountEl.textContent = formatCount(item && item.likes !== undefined ? item.likes : 0);
+    if(item && item.user_reaction === 'like'){
+      likeBtn.classList.add('active');
+    } else {
+      likeBtn.classList.remove('active');
+    }
+  }
+
+  function updateSoundUI(){
+    if(soundEnabled){
+      soundToggle.classList.add('active');
+      soundToggle.textContent = '🔊';
+      soundToggle.title = strings.soundOff;
+      player.muted = false;
+    } else {
+      soundToggle.classList.remove('active');
+      soundToggle.textContent = '🔇';
+      soundToggle.title = strings.soundOn;
+      player.muted = true;
+    }
+  }
+
+  function updateSubscribeButton(item){
+    if(!item || !item.author){
+      subscribeBtn.classList.add('hidden');
+      return;
+    }
+    subscribeBtn.classList.remove('hidden');
+    subscribeAuthorEl.textContent = '@' + item.author;
+    if(item.subscribed){
+      subscribeBtn.classList.add('active');
+      subscribeLabel.textContent = strings.subscribed;
+      subscribeBtn.title = strings.unsubscribe;
+    } else {
+      subscribeBtn.classList.remove('active');
+      subscribeLabel.textContent = strings.subscribe;
+      subscribeBtn.title = strings.subscribe;
+    }
+  }
+
+  function render(){
+    updateScrollFiller();
+    const item = currentItem();
+    if(!item){
+      card.classList.add('hidden');
+      empty.classList.remove('hidden');
+      updateCounter();
+      return;
+    }
+    empty.classList.add('hidden');
+    card.classList.remove('hidden');
+    showLoading(true);
+    userPaused = false;
+    if(viewTimeout){
+      clearTimeout(viewTimeout);
+      viewTimeout = null;
+    }
+    player.pause();
+    player.removeAttribute('src');
+    player.load();
+    player.poster = item.thumb_url || '';
+    titleEl.textContent = item.display || item.name || '';
+    metaEl.textContent = buildMeta(item);
+    openBtn.href = item.watch_url || '#';
+    updateLikeState(item);
+    updateSubscribeButton(item);
+    updateSoundUI();
+    updateCounter();
+    requestAnimationFrame(()=>{
+      if(item.file_url){
+        player.src = item.file_url;
+        player.play().catch(()=>{ showLoading(false); });
+      } else {
+        showLoading(false);
+      }
+    });
+    fetchState(item);
+    scheduleView(item);
+    prefetchAround();
+    ensureMore();
+  }
+
+  function prefetchAround(){
+    prefetch(index + 1);
+    prefetch(index + 2);
+  }
+
+  function prefetch(targetIndex){
+    if(targetIndex < 0 || targetIndex >= feed.length){
+      return;
+    }
+    const item = feed[targetIndex];
+    if(!item || !item.file_url || preloaded.has(item.path)){
+      return;
+    }
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.src = item.file_url;
+    preloaded.set(item.path, video);
+    if(preloaded.size > 36){
+      const first = preloaded.keys().next();
+      if(!first.done){
+        preloaded.delete(first.value);
+      }
+    }
+  }
+
+  function ensureMore(){
+    if(loadingMore || feed.length >= total){
+      return;
+    }
+    if(index >= feed.length - 3){
+      fetchMore();
+    }
+  }
+
+  async function fetchMore(){
+    if(loadingMore){
+      return;
+    }
+    loadingMore = true;
+    try{
+      const params = new URLSearchParams();
+      params.set('offset', String(feed.length));
+      params.set('sort', sortMode || 'name');
+      params.set('limit', String(batchSize));
+      const res = await fetch(feedUrl + '?' + params.toString());
+      if(!res.ok){
+        return;
+      }
+      const data = await res.json();
+      if(data && typeof data.total === 'number'){
+        total = data.total;
+      }
+      if(data && Array.isArray(data.items) && data.items.length){
+        data.items.forEach(item => feed.push(item));
+        updateCounter();
+        prefetchAround();
+        updateScrollFiller();
+      }
+    } catch(err){
+      console.error(err);
+    } finally {
+      loadingMore = false;
+    }
+  }
+
+  function scheduleView(item){
+    if(!item){
+      return;
+    }
+    if(viewTimeout){
+      clearTimeout(viewTimeout);
+      viewTimeout = null;
+    }
+    if(viewedPaths.has(item.path)){
+      return;
+    }
+    viewTimeout = setTimeout(()=>registerView(item), 2000);
+  }
+
+  async function registerView(item){
+    if(!item || viewedPaths.has(item.path)){
+      return;
+    }
+    viewedPaths.add(item.path);
+    try{
+      const res = await fetch(viewUrl, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({path:item.path})
+      });
+      if(!res.ok){
+        return;
+      }
+      const data = await res.json();
+      if(data && typeof data.views === 'number'){
+        item.views = data.views;
+        const current = currentItem();
+        if(current && current.path === item.path){
+          metaEl.textContent = buildMeta(item);
+        }
+      }
+    } catch(err){
+      console.error(err);
+    }
+  }
+
+  async function fetchState(item){
+    if(!item || stateCache.has(item.path)){
+      return;
+    }
+    stateCache.set(item.path, true);
+    try{
+      const params = new URLSearchParams();
+      params.set('path', item.path);
+      if(item.author){
+        params.set('author', item.author);
+      }
+      const res = await fetch(stateUrl + '?' + params.toString());
+      if(!res.ok){
+        return;
+      }
+      const data = await res.json();
+      if(data){
+        if(typeof data.likes === 'number'){
+          item.likes = data.likes;
+        }
+        if(typeof data.dislikes === 'number'){
+          item.dislikes = data.dislikes;
+        }
+        if(data.user_reaction !== undefined){
+          item.user_reaction = data.user_reaction;
+        }
+        if(data.favorite !== undefined){
+          item.favorite = data.favorite;
+        }
+        if(typeof data.author_subscribed === 'boolean'){
+          item.subscribed = data.author_subscribed;
+          updateSubscribeButton(currentItem());
+        }
+        updateLikeState(item);
+      }
+    } catch(err){
+      console.error(err);
+    }
+  }
+
+  async function toggleLike(){
+    const item = currentItem();
+    if(!item){
+      return;
+    }
+    if(!isAuth){
+      window.location = loginUrl;
+      return;
+    }
+    try{
+      const res = await fetch(likeUrl, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({path:item.path})
+      });
+      if(res.status === 401){
+        window.location = loginUrl;
+        return;
+      }
+      if(!res.ok){
+        return;
+      }
+      const data = await res.json();
+      if(data){
+        if(typeof data.likes === 'number'){
+          item.likes = data.likes;
+        }
+        if(data.user_reaction !== undefined){
+          item.user_reaction = data.user_reaction;
+        }
+        updateLikeState(item);
+      }
+    } catch(err){
+      console.error(err);
+    }
+  }
+
+  async function toggleSubscription(){
+    const item = currentItem();
+    if(!item || !item.author){
+      return;
+    }
+    if(!isAuth){
+      window.location = registerUrl;
+      return;
+    }
+    const shouldSubscribe = !item.subscribed;
+    const target = shouldSubscribe ? subscribeUrl : unsubscribeUrl;
+    try{
+      const res = await fetch(target, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({author:item.author})
+      });
+      if(res.status === 401){
+        window.location = loginUrl;
+        return;
+      }
+      if(!res.ok){
+        return;
+      }
+      const data = await res.json();
+      if(data && typeof data.subscribed === 'boolean'){
+        updateSubscriptionForAuthor(item.author_key, data.subscribed);
+        updateSubscribeButton(currentItem());
+      }
+    } catch(err){
+      console.error(err);
+    }
+  }
+
+  function updateSubscriptionForAuthor(key, subscribed){
+    if(!key){
+      return;
+    }
+    feed.forEach(entry => {
+      if(entry.author_key === key){
+        entry.subscribed = subscribed;
+      }
+    });
+  }
+
+  function gotoNext(){
+    if(!feed.length){
+      return;
+    }
+    if(index < feed.length - 1){
+      setIndex(index + 1, {scroll:true});
+    } else if(feed.length < total){
+      fetchMore().then(()=>{
+        if(index < feed.length - 1){
+          setIndex(index + 1, {scroll:true});
+        } else {
+          updateScrollFiller();
+          updateCounter();
+        }
+      });
+    } else {
+      scrollToCurrent(false);
+    }
+  }
+
+  function gotoPrev(){
+    if(!feed.length){
+      return;
+    }
+    if(index > 0){
+      setIndex(index - 1, {scroll:true});
+    } else {
+      scrollToCurrent(false);
+    }
+  }
+
+  function handleNavigate(direction){
+    const now = Date.now();
+    if(now - lastNav < 250){
+      return;
+    }
+    lastNav = now;
+    setIndex(direction > 0 ? index + 1 : index - 1, {scroll:true});
+  }
+
+  likeBtn.addEventListener('click', toggleLike);
+  subscribeBtn.addEventListener('click', toggleSubscription);
+  prevBtn.addEventListener('click', ()=>handleNavigate(-1));
+  nextBtn.addEventListener('click', ()=>handleNavigate(1));
+
+  stage.addEventListener('scroll', ()=>{
+    if(scrollLock){
+      return;
+    }
+    const height = stageHeight();
+    if(!height){
+      return;
+    }
+    const target = clampIndexValue(Math.round(stage.scrollTop / height));
+    if(target !== index){
+      index = target;
+      render();
+    }
+    if(scrollSnapTimer){
+      clearTimeout(scrollSnapTimer);
+    }
+    scrollSnapTimer = setTimeout(()=>{
+      if(scrollLock){
+        return;
+      }
+      scrollToCurrent(false);
+    }, 120);
+  }, {passive:true});
+
+  window.addEventListener('resize', ()=>{
+    updateScrollFiller();
+    scrollToCurrent(true);
+  });
+
+  soundToggle.addEventListener('click', ()=>{
+    soundEnabled = !soundEnabled;
+    updateSoundUI();
+    if(!player.paused && player.readyState >= 2){
+      player.play().catch(()=>{});
+    }
+  });
+
+  player.addEventListener('click', ()=>{
+    if(player.paused){
+      userPaused = false;
+      player.play().catch(()=>{});
+    } else {
+      userPaused = true;
+      player.pause();
+    }
+  });
+
+  player.addEventListener('waiting', ()=>showLoading(true));
+  player.addEventListener('playing', ()=>showLoading(false));
+  player.addEventListener('loadeddata', ()=>showLoading(false));
+  player.addEventListener('pause', ()=>{
+    if(!userPaused){
+      showLoading(false);
+    }
+  });
+
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.hidden){
+      player.pause();
+    } else if(!userPaused){
+      player.play().catch(()=>{});
+    }
+  });
+
+  window.addEventListener('keydown', (event)=>{
+    if(event.key === 'ArrowDown' || event.key === 'PageDown'){
+      event.preventDefault();
+      handleNavigate(1);
+    } else if(event.key === 'ArrowUp' || event.key === 'PageUp'){
+      event.preventDefault();
+      handleNavigate(-1);
+    } else if(event.key === ' '){
+      event.preventDefault();
+      if(player.paused){
+        userPaused = false;
+        player.play().catch(()=>{});
+      } else {
+        userPaused = true;
+        player.pause();
+      }
+    }
+  });
+
+  render();
+  scrollToCurrent(true);
+})();
+</script>
+</body>
+</html>
+"""
+
+TEMPLATE_VIDEO = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>{{ video_name }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+:root {
+  --bg:#0d1117;
+  --card:#11151b;
+  --text:#e6edf3;
+  --muted:#9aa4b2;
+  --shadow:0 10px 30px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:\"Inter\",\"Segoe UI\",Arial,sans-serif;
+  margin:0;
+}
+.container{
+  max-width:1200px;
+  margin:auto;
+  padding:16px;
+}
+h1{
+  margin:8px 0 14px;
+  text-align:center;
+  font-weight:800;
+}
+.topbar{
+  display:flex;
+  gap:10px;
+  justify-content:center;
+  flex-wrap:wrap;
+  margin-bottom:12px;
+}
+.btn{ 
+  background:#222b35;
+  color:#fff;
+  border:0;
+  border-radius:10px;
+  padding:8px 12px;
+  text-decoration:none;
+  cursor:pointer;
+  transition:.2s;
+}
+.btn:hover{background:#2a3440}
+.btn.subscribe.active{background:#238636}
+.btn.subscribe.active:hover{background:#2ea043}
+.btn.disabled{opacity:0.6;cursor:not-allowed}
+.btn.logout{background:#dc3545}
+.btn.logout:hover{background:#ff4757}
+.btn.del{background:#dc3545}
+.btn.del:hover{background:#ff4757}
+.badge{color:var(--muted)}
+.user-chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:10px;background:#1c2129;color:#e6edf3;border:1px solid #2a3440;font-weight:600}
+.stats{
+  display:flex;
+  gap:14px;
+  justify-content:center;
+  margin:12px 0;
+  color:var(--muted);
+  flex-wrap:wrap;
+}
+.grid{
+  display:grid;
+  gap:14px;
+  grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+  margin-top:18px;
+}
+.card{
+  background:var(--card);
+  border-radius:12px;
+  overflow:hidden;
+  box-shadow:var(--shadow);
+  transition:.2s;
+}
+.card:hover{transform:translateY(-3px);box-shadow:0 6px 20px rgba(0,0,0,.45)}
+.thumb{width:100%;aspect-ratio:16/9;object-fit:cover;background:#000}
+.title{padding:8px 10px;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta-mini{padding:0 10px 10px;font-size:12px;color:var(--muted)}
+
+video {
+  width:100%;
+  max-height:75vh;
+  border-radius:16px;
+  background:#000;
+  display:block;
+}
+@media(max-width:900px){
+  .container{padding:8px}
+  video{max-height:60vh}
+}
+.disabled{opacity:0.6;cursor:not-allowed}
+.active{background:#238636}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="topbar">
+    <a class="btn" href="{{ url_for('set_lang', code=('en' if lang=='ru' else 'ru')) }}">{{ ui['lang_btn'] }}</a>
+    <a class="btn" href="{{ random_url }}">🎲 {{ ui['random'] }}</a>
+    <a class="btn" href="{{ back_url }}">← {{ ui['back'] }}</a>
+    <a class="btn" href="{{ download_original_url }}" download="{{ download_original_name }}">{{ ui['download'] }}</a>
+    {% if is_admin %}
+      <a class="btn" href="{{ checkfix_url }}" onclick="return confirm('Run check & fix? / Запустить проверку и исправление?')">🩺 {{ ui['checkfix'] }}</a>
+      <a class="btn del" href="{{ delete_url }}" onclick="return confirm('Delete? / Удалить?')">🗑 {{ ui['delete'] }}</a>
+    {% endif %}
+    {% if current_user %}
+      <span class="user-chip">👤 {{ current_user['username'] }}</span>
+      <a class="btn" href="{{ url_for('upload_video') }}">⬆️ {{ ui['upload'] }}</a>
+      <a class="btn" href="{{ url_for('account_stats') }}">📊 {{ ui['account_stats'] }}</a>
+      <a class="btn" href="{{ url_for('favorites_page') }}">❤️ {{ ui['favorites'] }}</a>
+      {% if current_user['is_admin'] %}
+        <a class="btn" href="{{ url_for('admin_panel') }}">🛠 {{ ui['admin_panel'] }}</a>
+        <a class="btn" href="{{ url_for('moderator_panel') }}">🛡 {{ ui['moderator_panel'] }}</a>
+      {% elif current_user['is_moderator'] %}
+        <a class="btn" href="{{ url_for('moderator_panel') }}">🛡 {{ ui['moderator_panel'] }}</a>
+      {% endif %}
+      <a class="btn logout" href="{{ url_for('logout', next=request_path) }}">🚪 {{ ui['logout'] }}</a>
+    {% else %}
+      <a class="btn" href="{{ url_for('login', next=request_path) }}">🔑 {{ ui['login'] }}</a>
+      <a class="btn" href="{{ url_for('register', next=request_path) }}">🆕 {{ ui['register'] }}</a>
+    {% endif %}
+  </div>
+
+  <h1>{{ video_name }}</h1>
+
+  <!-- встроенный HTML5 плеер -->
+  <video controls preload="metadata" playsinline webkit-playsinline poster="{{ thumb_url if thumb_url else '' }}">
+    <source src="{{ file_url }}" type="video/mp4">
+    Ваш браузер не поддерживает видео.
+  </video>
+
+  <div class="stats">
+    <span>👁 <span id="views">{{ views }}</span> {{ ui['views'] }}</span>
+    <button class="btn" id="like">👍 <span id="likes">{{ likes }}</span></button>
+    <button class="btn" id="dislike">👎 <span id="dislikes">{{ dislikes }}</span></button>
+    <button class="btn" id="fav"><span id="favLabel">❤️ {% if fav %}★{% endif %}</span></button>
+    {% if author %}
+      <button class="btn subscribe {% if author_subscribed %}active{% endif %}" id="subscribeBtn">
+        {% if author_subscribed %}{{ ui['subscribed'] }}{% else %}{{ ui['subscribe'] }}{% endif %}
+      </button>
+    {% endif %}
+    <span class="badge">{{ duration }}</span>
+    <span class="badge">👤 {{ ui['author'] }}: {{ author or '—' }}</span>
+  </div>
+
+  <!-- 📂 Похожие видео из этой категории -->
+  <h2>📁 {{ ui['similar_here'] }}</h2>
+  <div class="grid">
+    {% for v in related_same %}
+      <div class="card">
+        <a href="{{ v['watch_url'] }}">
+          <img class="thumb" src="{{ v['thumb_url'] }}" alt="{{ v['display'] }}">
+          <div class="title">{{ v['display'] }}</div>
+          <div class="meta-mini">👤 {{ v.get('author') or '—' }}</div>
+        </a>
+      </div>
+    {% endfor %}
+  </div>
+
+  <!-- 🌍 Похожие видео из других категорий -->
+  <h2 style="margin-top:18px">🌍 {{ ui['similar_global'] }}</h2>
+  <div class="grid">
+    {% for v in related_global %}
+      <div class="card">
+        <a href="{{ v['watch_url'] }}">
+          <img class="thumb" src="{{ v['thumb_url'] }}" alt="{{ v['display'] }}">
+          <div class="title">{{ v['display'] }}</div>
+          <div class="meta-mini">👤 {{ v.get('author') or '—' }}</div>
+        </a>
+      </div>
+    {% endfor %}
+  </div>
+
+  {% if recommended %}
+    <!-- 🔥 Рекомендации -->
+    <h2 style="margin-top:18px">🔥 {{ ui['recommendations'] }}</h2>
+    <div class="grid">
+      {% for v in recommended %}
+        <div class="card">
+          <a href="{{ v['watch_url'] }}">
+            <img class="thumb" src="{{ v['thumb_url'] }}" alt="{{ v['display'] }}">
+            <div class="title">{{ v['display'] }}</div>
+            <div class="meta-mini">👤 {{ v.get('author') or '—' }}</div>
+          </a>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>
+<script>
+(function(){
+  const likeBtn=document.getElementById('like');
+  const dislikeBtn=document.getElementById('dislike');
+  const favBtn=document.getElementById('fav');
+  const favLabel=document.getElementById('favLabel');
+  const subscribeBtn=document.getElementById('subscribeBtn');
+  const loginRedirect={{ url_for('login', next=request_path)|tojson }};
+  const registerRedirect={{ url_for('register', next=request_path)|tojson }};
+  const stateUrl={{ url_for('api_state')|tojson }};
+  const videoPath={{ filepath|tojson }};
+  const authorName={{ (author or '')|tojson }};
+  const subscribeUrl={{ url_for('api_subscribe_author')|tojson }};
+  const unsubscribeUrl={{ url_for('api_unsubscribe_author')|tojson }};
+  const progressUrl={{ url_for('api_watch_progress')|tojson }};
+  const watchSession={{ watch_session_id|tojson }};
+  const durationSeconds={{ video_duration_seconds|tojson }};
+  const videoEl=document.querySelector('video');
+  let lastTime=0;
+  let accumulated=0;
+  let playing=false;
+
+  function captureProgress(){
+    if(!videoEl) return;
+    const current=videoEl.currentTime||0;
+    if(playing){
+      const delta=current-lastTime;
+      if(delta>0){
+        accumulated+=delta;
+      }
+    }
+    lastTime=current;
+  }
+
+  async function sendProgress(useBeacon){
+    if(accumulated<=0.4) return;
+    const payload=JSON.stringify({path:videoPath,session:watchSession,seconds:accumulated,duration:durationSeconds});
+    accumulated=0;
+    if(useBeacon && navigator.sendBeacon){
+      try{
+        navigator.sendBeacon(progressUrl,new Blob([payload],{type:'application/json'}));
+      }catch(e){}
+      return;
+    }
+    try{
+      await fetch(progressUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:payload,keepalive:true});
+    }catch(e){}
+  }
+
+  async function refreshState(){
+    try{
+      const authorParam=authorName?`&author=${encodeURIComponent(authorName)}`:'';
+      const res=await fetch(`${stateUrl}?path=${encodeURIComponent(videoPath)}${authorParam}`);
+      if(!res.ok) return;
+      const data=await res.json();
+      document.getElementById('likes').textContent=data.likes;
+      document.getElementById('dislikes').textContent=data.dislikes;
+      if(data.favorite){
+        favLabel.textContent='❤️ ★';
+      }else{
+        favLabel.textContent='❤️';
+      }
+      if(subscribeBtn){
+        if(data.author_subscribed){
+          subscribeBtn.classList.add('active');
+          subscribeBtn.textContent={{ ui['subscribed']|tojson }};
+        }else{
+          subscribeBtn.classList.remove('active');
+          subscribeBtn.textContent={{ ui['subscribe']|tojson }};
+        }
+      }
+      if(data.user_reaction==='like'){
+        likeBtn.classList.add('active');
+        dislikeBtn.classList.remove('active');
+      }else if(data.user_reaction==='dislike'){
+        dislikeBtn.classList.add('active');
+        likeBtn.classList.remove('active');
+      }else{
+        likeBtn.classList.remove('active');
+        dislikeBtn.classList.remove('active');
+      }
+      if(!data.authenticated){
+        likeBtn.classList.add('disabled');
+        dislikeBtn.classList.add('disabled');
+        favBtn.classList.add('disabled');
+        if(subscribeBtn){subscribeBtn.classList.add('disabled');}
+      }else{
+        likeBtn.classList.remove('disabled');
+        dislikeBtn.classList.remove('disabled');
+        favBtn.classList.remove('disabled');
+        if(subscribeBtn){subscribeBtn.classList.remove('disabled');}
+      }
+    }catch(e){console.error(e);}
+  }
+
+  async function postJSON(url){
+    const res=await fetch(url,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path: videoPath})
+    });
+    if(res.status===401){
+      window.location=loginRedirect;
+      return null;
+    }
+    if(!res.ok){
+      return null;
+    }
+    return res.json();
+  }
+
+  async function postAuthor(url){
+    const res=await fetch(url,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({author: authorName})
+    });
+    if(res.status===401){
+      window.location=loginRedirect;
+      return null;
+    }
+    if(!res.ok){
+      return null;
+    }
+    return res.json();
+  }
+
+  likeBtn.addEventListener('click', async()=>{
+    if(likeBtn.classList.contains('disabled')){window.location=loginRedirect;return;}
+    const data=await postJSON('{{ url_for('api_like') }}');
+    if(data){
+      document.getElementById('likes').textContent=data.likes;
+      document.getElementById('dislikes').textContent=data.dislikes;
+      refreshState();
+    }
+  });
+
+  dislikeBtn.addEventListener('click', async()=>{
+    if(dislikeBtn.classList.contains('disabled')){window.location=loginRedirect;return;}
+    const data=await postJSON('{{ url_for('api_dislike') }}');
+    if(data){
+      document.getElementById('likes').textContent=data.likes;
+      document.getElementById('dislikes').textContent=data.dislikes;
+      refreshState();
+    }
+  });
+
+  favBtn.addEventListener('click', async()=>{
+    if(favBtn.classList.contains('disabled')){window.location=registerRedirect;return;}
+    const isFav=favLabel.textContent.includes('★');
+    const url=isFav?'{{ url_for('api_unfavorite') }}':'{{ url_for('api_favorite') }}';
+    const data=await postJSON(url);
+    if(data){
+      if(typeof data.favorite!=='undefined'){
+        favLabel.textContent=data.favorite?'❤️ ★':'❤️';
+      }
+      refreshState();
+    }
+  });
+
+  if(subscribeBtn && authorName){
+    subscribeBtn.addEventListener('click', async()=>{
+      if(subscribeBtn.classList.contains('disabled')){window.location=loginRedirect;return;}
+      const subscribing=!subscribeBtn.classList.contains('active');
+      const url=subscribing?subscribeUrl:unsubscribeUrl;
+      const data=await postAuthor(url);
+      if(data){
+        if(subscribing){
+          subscribeBtn.classList.add('active');
+          subscribeBtn.textContent={{ ui['subscribed']|tojson }};
+        }else{
+          subscribeBtn.classList.remove('active');
+          subscribeBtn.textContent={{ ui['subscribe']|tojson }};
+        }
+      }
+    });
+  }
+
+  if(videoEl){
+    videoEl.addEventListener('play',()=>{
+      lastTime=videoEl.currentTime||0;
+      playing=true;
+    });
+    videoEl.addEventListener('pause',()=>{
+      captureProgress();
+      playing=false;
+      sendProgress(false).catch(()=>{});
+    });
+    videoEl.addEventListener('timeupdate',()=>{
+      if(!playing) { lastTime=videoEl.currentTime||0; return; }
+      const current=videoEl.currentTime||0;
+      const delta=current-lastTime;
+      if(delta>0){
+        accumulated+=delta;
+      }
+      lastTime=current;
+      if(accumulated>=10){
+        sendProgress(false).catch(()=>{});
+      }
+    });
+    videoEl.addEventListener('seeked',()=>{
+      lastTime=videoEl.currentTime||0;
+    });
+    videoEl.addEventListener('ended',()=>{
+      captureProgress();
+      playing=false;
+      sendProgress(false).catch(()=>{});
+    });
+    setInterval(()=>{
+      if(!videoEl) return;
+      captureProgress();
+      sendProgress(false).catch(()=>{});
+    },15000);
+    document.addEventListener('visibilitychange',()=>{
+      if(document.visibilityState==='hidden'){
+        captureProgress();
+        playing=false;
+        sendProgress(true).catch(()=>{});
+      }
+    });
+    const flush=()=>{
+      captureProgress();
+      playing=false;
+      sendProgress(true).catch(()=>{});
+    };
+    window.addEventListener('beforeunload',flush);
+    window.addEventListener('pagehide',flush);
+  }
+
+  refreshState();
+})();
+</script>
+</body>
+</html>
+"""
+
+TEMPLATE_RANDOM_SETTINGS = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>🎛 {{ ui['random_settings'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:\"Inter\",\"Segoe UI\",Arial,sans-serif;margin:0}
+.container{max-width:900px;margin:auto;padding:26px}
+h1{margin:0 0 16px;font-weight:800}
+.card{background:#11151b;border-radius:12px;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:12px}
+.item{background:#151b23;padding:10px;border-radius:10px}
+.btn{display:inline-block;margin-top:16px;background:#238636;color:#fff;text-decoration:none;padding:10px 14px;border-radius:10px}
+.btn:hover{background:#2ea043}
+.badge{color:#9aa4b2;margin-left:8px}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🎛 {{ ui['random_settings'] }}</h1>
+  <div class="card">
+    <p>{{ ui['random_from'] }} <span class="badge">({{ ui['save'] }} ⇒ cookie)</span></p>
+    <form method="post">
+      <div class="grid">
+        {% for d in top_dirs %}
+          <label class="item">
+            <input type="checkbox" name="dir" value="{{ d }}" {% if d in selected %}checked{% endif %}>
+            <span style="margin-left:6px">{{ d }}</span>
+          </label>
+        {% endfor %}
+      </div>
+      <button class="btn" type="submit">✅ {{ ui['save'] }}</button>
+      <a class="btn" href="{{ url_for('browse', subpath='') }}" style="background:#30363d;margin-left:6px">← {{ ui['back'] }}</a>
+    </form>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+TEMPLATE_FAVORITES = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>❤️ {{ ui['favorites'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:\"Inter\",\"Segoe UI\",Arial,sans-serif;margin:0}
+.container{max-width:1200px;margin:auto;padding:26px}
+h1{margin:0 0 16px;font-weight:800}
+.grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.card{background:#11151b;border-radius:12px;overflow:hidden}
+.thumb{width:100%;aspect-ratio:16/9;object-fit:cover;background:#000}
+.title{padding:10px 12px;text-align:center}
+.meta-mini{padding:0 12px 12px;text-align:center;color:#9aa4b2;font-size:12px}
+.muted{color:#9aa4b2}
+.notice{margin-bottom:16px}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>❤️ {{ ui['favorites'] }}</h1>
+  {% if current_user %}
+    <div class="notice">{{ ui['account'] }}: {{ current_user['username'] }}</div>
+  {% endif %}
+  {% if items %}
+    <div class="grid">
+      {% for v in items %}
+        <div class="card">
+          <a href="{{ v['watch_url'] }}">
+            <video class="thumb" muted playsinline preload="none"
+                   poster="{{ v['thumb_url'] }}"
+                   data-preview="{{ v['preview_url'] }}"></video>
+            <div class="title">{{ v['display'] }}</div>
+            <div class="meta-mini">👤 {{ v.get('author') or '—' }}</div>
+          </a>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">—</p>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
+
+TEMPLATE_UPLOAD = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>⬆️ {{ ui['upload'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:"Inter","Segoe UI",Arial,sans-serif;margin:0}
+.container{max-width:900px;margin:auto;padding:26px}
+h1{margin:0 0 16px;font-weight:800}
+form{display:grid;gap:14px;background:#11151b;padding:18px;border-radius:12px}
+label{display:flex;flex-direction:column;gap:6px;font-size:14px}
+input[type=file],select,input[type=text]{background:#151b23;color:#e6edf3;border:1px solid #2a3440;border-radius:10px;padding:10px}
+button{background:#238636;color:#fff;border:0;padding:10px 14px;border-radius:10px;cursor:pointer}
+button:hover{background:#2ea043}
+.muted{color:#9aa4b2;font-size:13px}
+.alert{padding:12px 14px;border-radius:10px;margin-bottom:12px}
+.alert.ok{background:#102820;color:#7ee787}
+.alert.err{background:#2c1515;color:#ffa198}
+table{width:100%;border-collapse:collapse;margin-top:20px;background:#11151b;border-radius:12px;overflow:hidden}
+th,td{padding:10px;border-bottom:1px solid #1f2630;text-align:left;font-size:14px}
+th{background:#151b23}
+.status{font-weight:600}
+.status.pending{color:#f1c40f}
+.status.approved{color:#2ecc71}
+.status.rejected{color:#e74c3c}
+.toolbar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+.btn{background:#222b35;color:#e6edf3;padding:8px 12px;border-radius:10px;text-decoration:none}
+.btn:hover{background:#2a3440}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="toolbar">
+    <a class="btn" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
+    <a class="btn" href="{{ url_for('account_stats') }}">📊 {{ ui['account_stats'] }}</a>
+    {% if current_user and current_user['is_admin'] %}
+      <a class="btn" href="{{ url_for('admin_panel') }}">🛠 {{ ui['admin_panel'] }}</a>
+    {% elif current_user and current_user['is_moderator'] %}
+      <a class="btn" href="{{ url_for('moderator_panel') }}">🛡 {{ ui['moderator_panel'] }}</a>
+    {% endif %}
+  </div>
+  <h1>⬆️ {{ ui['upload'] }}</h1>
+  {% if message %}<div class="alert ok">{{ message }}</div>{% endif %}
+  {% if error %}<div class="alert err">{{ error }}</div>{% endif %}
+  <form method="post" enctype="multipart/form-data">
+    <label>
+      {{ ui['select_file'] }}
+      <input type="file" name="video" accept="video/mp4" required>
+    </label>
+    <label>
+      {{ ui['choose_folder'] }}
+      <select name="target_folder">
+        <option value="">community</option>
+        {% for d in top_dirs %}
+          <option value="{{ d }}" {% if d == default_folder %}selected{% endif %}>{{ d }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      Custom
+      <input type="text" name="custom_folder" placeholder="uploads/my-folder">
+    </label>
+    <button type="submit">✅ {{ ui['submit_upload'] }}</button>
+    <div class="muted">{{ ui['upload_rules'] }}</div>
+  </form>
+
+  <h2 style="margin-top:22px">📜 {{ ui['upload_history'] }}</h2>
+  {% if history %}
+    <table>
+      <tr>
+        <th>{{ ui['videos'] }}</th>
+        <th>{{ ui['target_folder'] }}</th>
+        <th>{{ ui['status_pending'] }}</th>
+        <th>{{ ui['notes'] }}</th>
+        <th>🕒</th>
+      </tr>
+      {% for item in history %}
+        {% set status_class = 'status ' + item['status'] %}
+        {% if item['status'] == 'pending' %}
+          {% set status_label = ui['status_pending'] %}
+        {% elif item['status'] == 'approved' %}
+          {% set status_label = ui['status_approved'] %}
+        {% else %}
+          {% set status_label = ui['status_rejected'] %}
+        {% endif %}
+        <tr>
+          <td>{{ item['original_name'] }}</td>
+          <td>{{ item['target_folder'] or 'community' }}</td>
+          <td class="{{ status_class }}">{{ status_label }}</td>
+          <td>{{ item['notes'] or '' }}</td>
+          <td>{{ item['created_at'] }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">{{ ui['no_data'] }}</p>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
+
+TEMPLATE_ACCOUNT_STATS = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>📊 {{ ui['account_stats'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:"Inter","Segoe UI",Arial,sans-serif;margin:0}
+.container{max-width:960px;margin:auto;padding:26px}
+h1{margin:0 0 18px;font-weight:800}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
+.card{background:#11151b;border-radius:12px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+.card h3{margin:0 0 8px;font-size:16px}
+.value{font-size:26px;font-weight:800}
+.muted{color:#9aa4b2;font-size:14px}
+table{width:100%;border-collapse:collapse;margin-top:20px;background:#11151b;border-radius:12px;overflow:hidden}
+th,td{padding:10px;border-bottom:1px solid #1f2630;text-align:left}
+th{background:#151b23}
+.toolbar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+.btn{background:#222b35;color:#e6edf3;padding:8px 12px;border-radius:10px;text-decoration:none}
+.btn:hover{background:#2a3440}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="toolbar">
+    <a class="btn" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
+    <a class="btn" href="{{ url_for('upload_video') }}">⬆️ {{ ui['upload'] }}</a>
+    {% if current_user and current_user['is_admin'] %}
+      <a class="btn" href="{{ url_for('admin_panel') }}">🛠 {{ ui['admin_panel'] }}</a>
+    {% elif current_user and current_user['is_moderator'] %}
+      <a class="btn" href="{{ url_for('moderator_panel') }}">🛡 {{ ui['moderator_panel'] }}</a>
+    {% endif %}
+  </div>
+  <h1>📊 {{ ui['account_stats'] }}</h1>
+  <div class="cards">
+    <div class="card"><h3>{{ ui['views_count'] }}</h3><div class="value">{{ stats.views }}</div></div>
+    <div class="card"><h3>{{ ui['minutes_watched'] }}</h3><div class="value">{{ stats.minutes }}</div><div class="muted">{{ ui['minutes_short'] }}</div></div>
+    <div class="card"><h3>{{ ui['avg_minutes'] }}</h3><div class="value">{{ stats.avg }}</div></div>
+    <div class="card"><h3>{{ ui['favorites'] }}</h3><div class="value">{{ stats.favorites }}</div></div>
+  </div>
+  <div class="muted" style="margin-top:10px">{{ ui['last_view'] }}: {{ stats.last_view or '—' }}</div>
+
+  <h2 style="margin-top:24px">📦 {{ ui['uploads'] }}</h2>
+  <div class="cards">
+    <div class="card"><h3>{{ ui['uploads_pending'] }}</h3><div class="value">{{ uploads_counts.pending }}</div></div>
+    <div class="card"><h3>{{ ui['uploads_approved'] }}</h3><div class="value">{{ uploads_counts.approved }}</div></div>
+    <div class="card"><h3>{{ ui['uploads_rejected'] }}</h3><div class="value">{{ uploads_counts.rejected }}</div></div>
+  </div>
+
+  <h2 style="margin-top:24px">📜 {{ ui['upload_history'] }}</h2>
+  {% if uploads %}
+    <table>
+      <tr>
+        <th>{{ ui['videos'] }}</th>
+        <th>{{ ui['target_folder'] }}</th>
+        <th>{{ ui['status_pending'] }}</th>
+        <th>{{ ui['notes'] }}</th>
+        <th>🕒</th>
+      </tr>
+      {% for item in uploads %}
+        {% if item['status'] == 'pending' %}
+          {% set status_label = ui['status_pending'] %}
+        {% elif item['status'] == 'approved' %}
+          {% set status_label = ui['status_approved'] %}
+        {% else %}
+          {% set status_label = ui['status_rejected'] %}
+        {% endif %}
+        <tr>
+          <td>{{ item['original_name'] }}</td>
+          <td>{{ item['target_folder'] or 'community' }}</td>
+          <td>{{ status_label }}</td>
+          <td>{{ item['notes'] or '' }}</td>
+          <td>{{ item['created_at'] }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">{{ ui['no_data'] }}</p>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
+
+TEMPLATE_ADMIN_PANEL = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>🛠 {{ ui['admin_panel'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:"Inter","Segoe UI",Arial,sans-serif;margin:0}
+.container{max-width:1100px;margin:auto;padding:26px}
+h1{margin:0 0 16px;font-weight:800}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-bottom:20px}
+.card{background:#11151b;border-radius:12px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+.card h3{margin:0 0 8px;font-size:15px}
+.value{font-size:24px;font-weight:800}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.btn{background:#222b35;color:#e6edf3;padding:8px 12px;border-radius:10px;text-decoration:none}
+.btn:hover{background:#2a3440}
+table{width:100%;border-collapse:collapse;margin-top:18px;background:#11151b;border-radius:12px;overflow:hidden}
+th,td{padding:10px;border-bottom:1px solid #1f2630;text-align:left;font-size:14px}
+th{background:#151b23}
+form.inline{display:inline}
+textarea{width:100%;min-height:60px;background:#151b23;color:#e6edf3;border:1px solid #2a3440;border-radius:10px;padding:8px}
+input[type=text],select{background:#151b23;color:#e6edf3;border:1px solid #2a3440;border-radius:10px;padding:8px}
+button{background:#238636;color:#fff;border:0;padding:8px 12px;border-radius:10px;cursor:pointer}
+button:hover{background:#2ea043}
+.danger{background:#dc3545}
+.danger:hover{background:#ff4757}
+.status{font-weight:600}
+.status.pending{color:#f1c40f}
+.status.approved{color:#2ecc71}
+.status.rejected{color:#e74c3c}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="toolbar">
+    <a class="btn" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
+    <a class="btn" href="{{ url_for('upload_video') }}">⬆️ {{ ui['upload'] }}</a>
+    <a class="btn" href="{{ url_for('admin_protect') }}">🔐 {{ ui['manage_protected'] }}</a>
+  </div>
+  <h1>🛠 {{ ui['admin_panel'] }}</h1>
+  <div class="grid">
+    <div class="card"><h3>{{ ui['total_videos'] }}</h3><div class="value">{{ summary.videos }}</div></div>
+    <div class="card"><h3>{{ ui['total_users'] }}</h3><div class="value">{{ summary.users }}</div></div>
+    <div class="card"><h3>{{ ui['pending_uploads'] }}</h3><div class="value">{{ summary.pending }}</div></div>
+  </div>
+
+  <h2>👥 {{ ui['assign_moderators'] }}</h2>
+  <table>
+    <tr><th>{{ ui['user'] }}</th><th>{{ ui['role_admin'] }}</th><th>{{ ui['role_moderator'] }}</th><th>{{ ui['views_count'] }}</th><th>{{ ui['minutes_watched'] }}</th><th>{{ ui['favorites'] }}</th><th>{{ ui['last_view'] }}</th><th></th></tr>
+    {% for user in users %}
+      <tr>
+        <td>{{ user.username }}</td>
+        <td>{{ '✅' if user.is_admin else '—' }}</td>
+        <td>{{ '✅' if user.is_moderator else '—' }}</td>
+        <td>{{ user.views }}</td>
+        <td>{{ user.minutes }}</td>
+        <td>{{ user.favorites }}</td>
+        <td>{{ user.last_view or '—' }}</td>
+        <td>
+          {% if not user.is_admin %}
+            <form class="inline" method="post" action="{{ url_for('toggle_moderator', user_id=user.id) }}">
+              <input type="hidden" name="next" value="{{ request.path }}">
+              {% if user.is_moderator %}
+                <button type="submit" name="action" value="demote" class="danger">{{ ui['remove_moderator'] }}</button>
+              {% else %}
+                <button type="submit" name="action" value="promote">{{ ui['make_moderator'] }}</button>
+              {% endif %}
+            </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+  </table>
+
+  <h2 style="margin-top:28px">⏳ {{ ui['pending_uploads'] }}</h2>
+  {% if pending_uploads %}
+    <table>
+      <tr><th>ID</th><th>{{ ui['videos'] }}</th><th>{{ ui['user'] }}</th><th>{{ ui['target_folder'] }}</th><th>MB</th><th>🕒</th><th></th></tr>
+      {% for item in pending_uploads %}
+        <tr>
+          <td>{{ item['id'] }}</td>
+          <td>{{ item['original_name'] }}</td>
+          <td>{{ item['username'] }}</td>
+          <td>{{ item['target_folder'] }}</td>
+          <td>{{ '%.1f'|format(item['size_mb']) }}</td>
+          <td>{{ item['created_at'] }}</td>
+          <td>
+            <a class="btn" href="{{ url_for('download_pending_upload', upload_id=item['id']) }}">{{ ui['view_file'] }}</a>
+            <form class="inline" method="post" action="{{ url_for('approve_upload', upload_id=item['id']) }}">
+              <input type="hidden" name="next" value="{{ request.path }}">
+              <input type="text" name="target_folder" value="{{ item['target_folder'] }}" placeholder="{{ ui['target_folder'] }}">
+              <input type="text" name="notes" placeholder="{{ ui['notes'] }}">
+              <button type="submit">{{ ui['approve'] }}</button>
+            </form>
+            <form class="inline" method="post" action="{{ url_for('reject_upload', upload_id=item['id']) }}" onsubmit="return confirm('Reject upload?');">
+              <input type="hidden" name="next" value="{{ request.path }}">
+              <input type="text" name="notes" placeholder="{{ ui['notes'] }}">
+              <button type="submit" class="danger">{{ ui['reject'] }}</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">{{ ui['no_data'] }}</p>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
+
+TEMPLATE_MOD_PANEL = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>🛡 {{ ui['moderator_panel'] }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:"Inter","Segoe UI",Arial,sans-serif;margin:0}
+.container{max-width:1000px;margin:auto;padding:26px}
+h1{margin:0 0 16px;font-weight:800}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.btn{background:#222b35;color:#e6edf3;padding:8px 12px;border-radius:10px;text-decoration:none}
+.btn:hover{background:#2a3440}
+table{width:100%;border-collapse:collapse;background:#11151b;border-radius:12px;overflow:hidden}
+th,td{padding:10px;border-bottom:1px solid #1f2630;text-align:left;font-size:14px}
+th{background:#151b23}
+form.inline{display:inline}
+input[type=text]{background:#151b23;color:#e6edf3;border:1px solid #2a3440;border-radius:10px;padding:8px}
+button{background:#238636;color:#fff;border:0;padding:8px 12px;border-radius:10px;cursor:pointer}
+button:hover{background:#2ea043}
+.danger{background:#dc3545}
+.danger:hover{background:#ff4757}
+.muted{color:#9aa4b2}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="toolbar">
+    <a class="btn" href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a>
+    {% if current_user and current_user['is_admin'] %}
+      <a class="btn" href="{{ url_for('admin_panel') }}">🛠 {{ ui['admin_panel'] }}</a>
+    {% endif %}
+  </div>
+  <h1>🛡 {{ ui['moderator_panel'] }}</h1>
+  <h2>{{ ui['pending_uploads'] }}</h2>
+  {% if pending_uploads %}
+    <table>
+      <tr><th>ID</th><th>{{ ui['videos'] }}</th><th>{{ ui['user'] }}</th><th>{{ ui['target_folder'] }}</th><th>MB</th><th>🕒</th><th></th></tr>
+      {% for item in pending_uploads %}
+        <tr>
+          <td>{{ item['id'] }}</td>
+          <td>{{ item['original_name'] }}</td>
+          <td>{{ item['username'] }}</td>
+          <td>{{ item['target_folder'] }}</td>
+          <td>{{ '%.1f'|format(item['size_mb']) }}</td>
+          <td>{{ item['created_at'] }}</td>
+          <td>
+            <a class="btn" href="{{ url_for('download_pending_upload', upload_id=item['id']) }}">{{ ui['view_file'] }}</a>
+            <form class="inline" method="post" action="{{ url_for('approve_upload', upload_id=item['id']) }}">
+              <input type="hidden" name="next" value="{{ request.path }}">
+              <input type="text" name="target_folder" value="{{ item['target_folder'] }}" placeholder="{{ ui['target_folder'] }}">
+              <input type="text" name="notes" placeholder="{{ ui['notes'] }}">
+              <button type="submit">{{ ui['approve'] }}</button>
+            </form>
+            <form class="inline" method="post" action="{{ url_for('reject_upload', upload_id=item['id']) }}" onsubmit="return confirm('Reject upload?');">
+              <input type="hidden" name="next" value="{{ request.path }}">
+              <input type="text" name="notes" placeholder="{{ ui['notes'] }}">
+              <button type="submit" class="danger">{{ ui['reject'] }}</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">{{ ui['no_data'] }}</p>
+  {% endif %}
+
+  <h2 style="margin-top:24px">✅ {{ ui['uploads_approved'] }}</h2>
+  {% if recent_reviews %}
+    <table>
+      <tr><th>{{ ui['videos'] }}</th><th>{{ ui['status_pending'] }}</th><th>{{ ui['notes'] }}</th><th>🕒</th></tr>
+      {% for item in recent_reviews %}
+        {% if item['status'] == 'approved' %}
+          {% set status_label = ui['status_approved'] %}
+        {% elif item['status'] == 'rejected' %}
+          {% set status_label = ui['status_rejected'] %}
+        {% else %}
+          {% set status_label = ui['status_pending'] %}
+        {% endif %}
+        <tr>
+          <td>{{ item['original_name'] }}</td>
+          <td>{{ status_label }}</td>
+          <td>{{ item['notes'] or '' }}</td>
+          <td>{{ item['reviewed_at'] or item['created_at'] }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}
+    <p class="muted">{{ ui['no_data'] }}</p>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
+TEMPLATE_PROTECT = """<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>🔐 Защищённые папки</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:\"Inter\",\"Segoe UI\",Arial,sans-serif;margin:0}
+.container{max-width:900px;margin:auto;padding:26px}
+h1{margin:0 0 16px;font-weight:800}
+table{width:100%;border-collapse:collapse;margin-top:10px}
+th,td{padding:8px;border-bottom:1px solid #2a3440;text-align:left}
+input[type=password]{background:#151b23;color:#e6edf3;border:1px solid #2a3440;border-radius:8px;padding:6px}
+button{background:#238636;color:#fff;border:0;padding:6px 10px;border-radius:8px;cursor:pointer}
+button:hover{background:#2ea043}
+form{display:inline}
+.badge{color:#9aa4b2}
+a{color:#58a6ff;text-decoration:none}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🔐 Управление доступом к папкам</h1>
+  <a href="/" style="color:#58a6ff;text-decoration:none;">← Назад</a>
+  <table>
+    <tr><th>Папка</th><th>Статус</th><th>Пароль / Действие</th></tr>
+    {% for folder in folders %}
+      <tr>
+        <td>{{ folder }}</td>
+        {% if folder in protected %}
+          <td>🔒 Защищена</td>
+          <td>
+            <form method="post" style="display:inline">
+              <input type="hidden" name="action" value="remove">
+              <input type="hidden" name="folder" value="{{ folder }}">
+              <button type="submit">Снять защиту</button>
+            </form>
+          </td>
+        {% else %}
+          <td>—</td>
+          <td>
+            <form method="post" style="display:inline">
+              <input type="hidden" name="action" value="add">
+              <input type="hidden" name="folder" value="{{ folder }}">
+              <input type="password" name="password" placeholder="Пароль" required>
+              <button type="submit">Поставить</button>
+            </form>
+          </td>
+        {% endif %}
+      </tr>
+    {% endfor %}
+  </table>
+</div>
+</body>
+</html>
+"""
+
+TEMPLATE_AUTH = """<!doctype html>
+<html lang="{{ 'ru' if lang=='ru' else 'en' }}">
+<head>
+<meta charset="utf-8">
+<title>{{ title }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{background:#0d1117;color:#e6edf3;font-family:\"Inter\",\"Segoe UI\",Arial,sans-serif;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:#11151b;padding:30px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35);max-width:360px;width:100%}
+h1{margin:0 0 18px;font-size:22px;text-align:center}
+label{display:block;margin-bottom:10px;font-size:14px;color:#9aa4b2}
+input{width:100%;padding:10px;border-radius:10px;border:1px solid #2a3440;background:#151b23;color:#e6edf3;margin-bottom:12px}
+button{width:100%;background:#238636;color:#fff;border:0;padding:10px;border-radius:10px;cursor:pointer;font-size:15px}
+button:hover{background:#2ea043}
+.error{color:#ff6b6b;margin-bottom:12px;text-align:center}
+.alt{margin-top:12px;text-align:center}
+.alt a{color:#58a6ff;text-decoration:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>{{ title }}</h1>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post">
+    <input type="hidden" name="next" value="{{ next_url }}">
+    <label>{{ username_label }}</label>
+    <input type="text" name="username" required autofocus>
+    <label>{{ password_label }}</label>
+    <input type="password" name="password" required>
+    {% if show_confirm %}
+      <label>{{ confirm_label }}</label>
+      <input type="password" name="password_confirm" required>
+    {% endif %}
+    <button type="submit">{{ submit_label }}</button>
+  </form>
+  <div class="alt">{{ alt_text|safe }}</div>
+  <div class="alt" style="margin-top:8px"><a href="{{ url_for('browse', subpath='') }}">← {{ ui['back'] }}</a></div>
+</div>
+</body>
+</html>
+"""
+# -------------------------
+# ROUTES
+# -------------------------
+@app.route("/set-lang/<code>")
+def set_lang(code):
+    code = (code or "ru").lower()
+    if code not in ("ru","en"): code = "ru"
+    ref = request.headers.get("Referer") or url_for("browse", subpath="")
+    resp = make_response(redirect(ref))
+    resp.set_cookie("lang", code, max_age=60*60*24*365, path="/")
+    get_user_cookie(resp)
+    return resp
+
+
+@app.route("/settings/random", methods=["GET","POST"])
+def random_settings():
+    lang, ui = get_lang()
+    top_dirs = list_all_top_dirs()
+    raw = request.cookies.get("random_dirs") or "[]"
+    try:
+        selected = json.loads(raw)
+    except Exception:
+        selected = []
+    if request.method == "POST":
+        selected = request.form.getlist("dir")
+        ref = url_for("random_settings")
+        resp = make_response(redirect(ref))
+        resp.set_cookie("random_dirs", json.dumps(selected, ensure_ascii=False), max_age=60*60*24*365, path="/")
+        get_user_cookie(resp)
+        return resp
+    return render_template_string(TEMPLATE_RANDOM_SETTINGS, top_dirs=top_dirs, selected=selected, lang=lang, ui=ui)
+
+
+@app.route("/random-settings")
+def random_settings_alias():
+    return redirect(url_for("random_settings"))
+
+
+def get_random_dirs_from_cookie() -> List[str]:
+    raw = request.cookies.get("random_dirs") or "[]"
+    try:
+        arr = json.loads(raw)
+        if isinstance(arr, list): return [str(x) for x in arr]
+    except Exception:
+        pass
+    return []
+
+
+def require_access_for(rel_path: str) -> Optional[Response]:
+    scope = get_protected_root_for(rel_path)
+    if scope is None or is_admin_request(request) or user_has_persistent_access(scope):
+        return None
+    exp = request.args.get("exp")
+    sig = request.args.get("sig")
+    if not (exp and sig and verify_access_signature(scope, exp, sig)):
+        return abort(403)
+    return None
+
+
+@app.route("/", defaults={"subpath": ""}, methods=["GET","POST"], endpoint="browse")
+@app.route("/<path:subpath>", methods=["GET","POST"], endpoint="browse")
+def browse(subpath):
+    lang, ui = get_lang()
+    sort_mode = resolve_sort_mode()
+    sort_options = build_sort_options(ui)
+    is_admin = is_admin_request(request)
+
+    dir_abs = safe_join(VIDEO_ROOT, subpath)
+    if not os.path.exists(dir_abs) or not os.path.isdir(dir_abs): abort(404)
+
+    if subpath in _protected and not is_admin and not user_has_persistent_access(subpath):
+        if request.method == "POST":
+            pw = request.form.get("password", "")
+            if hashlib.sha256(pw.encode()).hexdigest() == _protected.get(subpath):
+                remember_folder_access(subpath)
+            else:
+                return render_template_string(TEMPLATE_ACCESS, error=ui["wrong_pass"], path=subpath, lang=lang, ui=ui, sort_mode=sort_mode)
+        else:
+            return render_template_string(TEMPLATE_ACCESS, error=None, path=subpath, lang=lang, ui=ui, sort_mode=sort_mode)
+
+    subfolders = list_subfolders(dir_abs)
+    videos     = list_videos_in_dir(dir_abs, lang)
+    enrich_cards_with_stats(videos, include_favorites=True)
+    apply_sort(videos, sort_mode)
+
+    title = ui["title_main"] if not subpath else subpath
+    crumbs = breadcrumbs_for(subpath)
+
+    return render_template_string(TEMPLATE_MAIN,
+        title=title, subfolders=subfolders, videos=videos,
+        crumbs=crumbs, lang=lang, ui=ui,
+        protected=_protected, is_admin=is_admin,
+        current_user=g.user,
+        sort_mode=sort_mode, sort_options=sort_options,
+        current_path=subpath
+    )
+
+
+@app.route("/access/<path:subpath>", methods=["GET", "POST"])
+def access_folder(subpath):
+    lang, ui = get_lang()
+    sort_mode = resolve_sort_mode()
+    sort_options = build_sort_options(ui)
+    sort_arg = sort_mode if sort_mode != "name" else None
+    if subpath not in _protected:
+        return redirect(url_for("browse", subpath=subpath, sort=sort_arg))
+    if is_admin_request(request) or user_has_persistent_access(subpath):
+        return redirect(url_for("browse", subpath=subpath, sort=sort_arg))
+    if request.method == "POST":
+        pw = request.form.get("password", "")
+        if hashlib.sha256(pw.encode()).hexdigest() == _protected.get(subpath):
+            remember_folder_access(subpath)
+            dir_abs = safe_join(VIDEO_ROOT, subpath)
+            if not os.path.isdir(dir_abs): abort(404)
+            subfolders = list_subfolders(dir_abs)
+            videos = list_videos_in_dir(dir_abs, lang)
+            enrich_cards_with_stats(videos, include_favorites=True)
+            apply_sort(videos, sort_mode)
+            title = ui["title_main"] if not subpath else subpath
+            crumbs = breadcrumbs_for(subpath)
+            return render_template_string(TEMPLATE_MAIN,
+                title=title, subfolders=subfolders, videos=videos,
+                crumbs=crumbs, lang=lang, ui=ui,
+                protected=_protected, is_admin=is_admin_request(request),
+                current_user=g.user,
+                sort_mode=sort_mode, sort_options=sort_options,
+                current_path=subpath
+            )
+        else:
+            return render_template_string(TEMPLATE_ACCESS, error=ui["wrong_pass"], path=subpath, lang=lang, ui=ui, sort_mode=sort_mode)
+    return render_template_string(TEMPLATE_ACCESS, error=None, path=subpath, lang=lang, ui=ui, sort_mode=sort_mode)
+
+@app.route("/watch/<path:filepath>")
+def watch_video(filepath):
+    lang, ui = get_lang()
+    is_admin = is_admin_request(request)
+
+    full = safe_join(VIDEO_ROOT, filepath)
+    if not os.path.isfile(full): abort(404)
+
+    scope = get_protected_root_for(filepath)
+    if scope and not (is_admin or user_has_persistent_access(scope)):
+        exp = request.args.get("exp"); sig = request.args.get("sig")
+        if not (exp and sig and verify_access_signature(scope, exp, sig)):
+            return redirect(url_for("access_folder", subpath=scope))
+
+    resp = make_response()
+
+    video_duration_seconds = ffprobe_duration(full)
+
+    if register_view_if_new(filepath, resp):
+        _views[filepath] = _views.get(filepath, 0) + 1
+        save_views()
+        mark_popular_dirty()
+
+    current_dir_abs   = os.path.dirname(full)
+    current_dir_rel   = os.path.relpath(current_dir_abs, VIDEO_ROOT).replace("\\","/")
+    current_dir_prefix= (current_dir_rel + "/") if current_dir_rel != "." else ""
+
+    current_author = author_for_path(filepath)
+    author_subscribed = is_author_subscribed(current_author)
+
+    same_dir = [v for v in list_videos_in_dir(current_dir_abs, lang) if v["path"] != filepath]
+    enrich_cards_with_stats(same_dir, include_favorites=True)
+    related_same = random.sample(same_dir, min(5, len(same_dir))) if same_dir else []
+    attach_secure_urls(related_same)
+
+    candidate_pool = build_recommendation_pool(filepath, lang, current_author, current_dir_prefix, desired=400)
+    enrich_cards_with_stats(candidate_pool, include_favorites=True)
+    global_pool = [v for v in candidate_pool if not (current_dir_prefix and v["path"].startswith(current_dir_prefix))]
+    random.shuffle(global_pool)
+    related_global = global_pool[:min(5, len(global_pool))]
+    attach_secure_urls(related_global)
+
+    used_paths = {v["path"] for v in related_same} | {v["path"] for v in related_global}
+    recommended_candidates = recommend_videos(filepath, candidate_pool, current_author, current_dir_prefix, limit=8)
+    recommended: List[Dict] = []
+    for entry in recommended_candidates:
+        if entry["path"] in used_paths:
+            continue
+        recommended.append(entry)
+        if len(recommended) >= 6:
+            break
+    attach_secure_urls(recommended)
+
+    counts = reaction_counts([filepath]).get(filepath, {"likes": 0, "dislikes": 0})
+    likes, dislikes = counts.get("likes", 0), counts.get("dislikes", 0)
+
+    get_user_cookie(resp)
+
+    fav = is_favorite(filepath)
+
+    video_name_disp = translate_title_if_needed(os.path.basename(full), lang)
+    duration_disp   = format_duration(video_duration_seconds)
+
+    file_url         = with_grant(url_for('serve_file', filepath=filepath), scope)
+    back_url         = with_grant(url_for('browse', subpath=os.path.dirname(filepath)), scope)
+    random_url       = with_grant(url_for('random_video'), scope)
+    delete_url       = with_grant(url_for('admin_delete', filepath=filepath), scope) if is_admin else ""
+    checkfix_url     = with_grant(url_for('admin_checkfix', filepath=filepath), scope) if is_admin else ""
+
+    heights          = available_heights_for(full)
+    stream_base      = with_grant(url_for('stream_transcoded', filepath=filepath), scope)
+    download_original_url = with_grant(url_for('download_video', filepath=filepath), scope)
+    download_height_urls  = {h: with_grant(url_for('download_transcoded', filepath=filepath, h=h), scope) for h in heights}
+
+    base_name = os.path.splitext(os.path.basename(full))[0]
+    download_original_name = f"{base_name}.mp4"
+    download_height_names = {h: f"{base_name}_{h}p.mp4" for h in heights}
+
+    watch_session_id = uuid.uuid4().hex
+
+    html = render_template_string(
+        TEMPLATE_VIDEO,
+        video_name=video_name_disp, filepath=filepath, back_url=back_url, random_url=random_url,
+        download_original_url=download_original_url, download_height_urls=download_height_urls,
+        download_original_name=download_original_name, download_height_names=download_height_names,
+        delete_url=delete_url, checkfix_url=checkfix_url, heights=heights,
+        is_admin=is_admin, related_same=related_same, related_global=related_global,
+        recommended=recommended,
+        lang=lang, ui=ui, views=_views.get(filepath,0), likes=likes, dislikes=dislikes, fav=fav,
+        duration=duration_disp, file_url=file_url, stream_base=stream_base,
+        thumb_url=with_grant(url_for('serve_file', filepath=os.path.relpath(generate_thumbnail(full), VIDEO_ROOT).replace("\\","/")), scope if scope else None),
+        current_user=g.user, request_path=request.full_path if request.query_string else request.path,
+        author=current_author, author_subscribed=author_subscribed, watch_session_id=watch_session_id,
+        video_duration_seconds=video_duration_seconds
+    )
+    resp.set_data(html)
+    return resp
+
+
+@app.route("/files/<path:filepath>")
+def serve_file(filepath):
+    rel = filepath.replace("\\", "/")
+    need = require_access_for(rel)
+    if need is not None:
+        return need
+
+    full = safe_join(VIDEO_ROOT, filepath)
+    if not os.path.exists(full):
+        abort(404)
+
+    file_size = os.path.getsize(full)
+    last_modified = http_date(os.path.getmtime(full))
+
+    range_header = request.headers.get("Range")
+    if range_header:
+        parsed = parse_range_header(range_header, file_size)
+        if parsed is None or not parsed.ranges:
+            resp = Response(status=416)
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Content-Range"] = f"bytes */{file_size}"
+            resp.headers["Content-Length"] = "0"
+            resp.headers["Last-Modified"] = last_modified
+            return resp
+
+        start, end = parsed.ranges[0]
+        if start is None:
+            if end is None:
+                start = 0
+                end = file_size - 1
+            else:
+                if end <= 0:
+                    resp = Response(status=416)
+                    resp.headers["Accept-Ranges"] = "bytes"
+                    resp.headers["Content-Range"] = f"bytes */{file_size}"
+                    resp.headers["Content-Length"] = "0"
+                    resp.headers["Last-Modified"] = last_modified
+                    return resp
+                length = min(end, file_size)
+                start = file_size - length
+                end = file_size - 1
+        else:
+            if start >= file_size:
+                resp = Response(status=416)
+                resp.headers["Accept-Ranges"] = "bytes"
+                resp.headers["Content-Range"] = f"bytes */{file_size}"
+                resp.headers["Content-Length"] = "0"
+                resp.headers["Last-Modified"] = last_modified
+                return resp
+            if end is None or end >= file_size:
+                end = file_size - 1
+
+        length = end - start + 1
+        if length <= 0:
+            resp = Response(status=416)
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Content-Range"] = f"bytes */{file_size}"
+            resp.headers["Content-Length"] = "0"
+            resp.headers["Last-Modified"] = last_modified
+            return resp
+
+        if request.method == "HEAD":
+            resp = Response(status=206)
+            resp.headers["Content-Length"] = str(length)
+        else:
+            file_handle = open(full, "rb")
+            file_handle.seek(start)
+            wrapped = wrap_file(request.environ, file_handle)
+
+            def cleanup() -> None:
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
+
+            resp = Response(wrapped, status=206, mimetype="video/mp4", direct_passthrough=True)
+            resp.call_on_close(cleanup)
+            resp.content_length = length
+
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        resp.headers["Last-Modified"] = last_modified
+        resp.headers.setdefault("Content-Type", "video/mp4")
+        return resp
+
+    if request.method == "HEAD":
+        resp = Response(status=200)
+        resp.headers["Content-Length"] = str(file_size)
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        resp.headers["Last-Modified"] = last_modified
+        resp.headers["Content-Type"] = "video/mp4"
+        return resp
+
+    resp = send_file(
+        full,
+        mimetype="video/mp4",
+        as_attachment=False,
+        conditional=True,
+        download_name=os.path.basename(full)
+    )
+
+    resp.headers["Accept-Ranges"] = "bytes"
+    resp.headers.setdefault("Cache-Control", "public, max-age=3600")
+    resp.headers.setdefault("Last-Modified", last_modified)
+    return resp
+
+
+@app.route("/preview/<path:filepath>")
+def preview_file(filepath):
+    rel = filepath.replace("\\","/")
+    need = require_access_for(rel)
+    if need is not None: return need
+
+    full = safe_join(VIDEO_ROOT, filepath)
+    if not os.path.isfile(full): abort(404)
+    preview_abs = ensure_preview(full)
+    rel_from_root = os.path.relpath(preview_abs, VIDEO_ROOT).replace("\\","/")
+    return serve_file(rel_from_root)
+
+# ---------- Dynamic TRANSCODE streaming & download ----------
+def stream_ffmpeg_process(cmd):
+    """Yield ffmpeg stdout in chunks; kill on client disconnect."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=256 * 1024)
+    try:
+        while True:
+            chunk = proc.stdout.read(256 * 1024)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def validate_height_for(full_path: str, h: int) -> int:
+    _, src_h = probe_video_size(full_path)
+    h = int(h)
+    if h > src_h:
+        candidates = [x for x in COMMON_HEIGHTS if x <= src_h]
+        h = candidates[0] if candidates else src_h
+    if h < 180:
+        h = 180
+    return h
+
+
+@app.route("/stream/<path:filepath>")
+def stream_transcoded(filepath):
+    rel = filepath.replace("\\","/")
+    scope = get_protected_root_for(rel)
+    if scope and not is_admin_request(request):
+        exp = request.args.get("exp"); sig = request.args.get("sig")
+        if not (exp and sig and verify_access_signature(scope, exp, sig)):
+            return abort(403)
+
+    h = request.args.get("h", type=int)
+    if not h:
+        return redirect(url_for('serve_file', filepath=filepath))
+    full = safe_join(VIDEO_ROOT, filepath)
+    if not os.path.isfile(full): abort(404)
+
+    h = validate_height_for(full, h)
+    cmd = ffmpeg_stream_cmd(full, h)
+
+    headers = {
+        "Content-Type": "video/mp4",
+        "Cache-Control": "no-store",
+        "Transfer-Encoding": "chunked",
+        "Accept-Ranges": "none"
+    }
+    return Response(stream_with_context(stream_ffmpeg_process(cmd)), headers=headers)
+
+
+@app.route("/download/<path:filepath>")
+def download_video(filepath):
+    rel = filepath.replace("\\","/")
+    need = require_access_for(rel)
+    if need is not None: return need
+
+    full = safe_join(VIDEO_ROOT, filepath)
+    if not os.path.isfile(full): abort(404)
+    return send_file(full, as_attachment=True)
+
+
+@app.route("/download_transcoded/<path:filepath>")
+def download_transcoded(filepath):
+    rel = filepath.replace("\\","/")
+    scope = get_protected_root_for(rel)
+    if scope and not is_admin_request(request):
+        exp = request.args.get("exp"); sig = request.args.get("sig")
+        if not (exp and sig and verify_access_signature(scope, exp, sig)):
+            return abort(403)
+
+    h = request.args.get("h", type=int)
+    if not h:
+        return redirect(url_for('download_video', filepath=filepath))
+    full = safe_join(VIDEO_ROOT, filepath)
+    if not os.path.isfile(full): abort(404)
+
+    h = validate_height_for(full, h)
+    cmd = ffmpeg_stream_cmd(full, h)
+    base = os.path.splitext(os.path.basename(full))[0]
+    fname = f"{base}_{h}p.mp4"
+    headers = {
+        "Content-Type": "video/mp4",
+        "Content-Disposition": f'attachment; filename="{fname}"',
+        "Cache-Control": "no-store",
+        "Transfer-Encoding": "chunked",
+        "Accept-Ranges": "none"
+    }
+    return Response(stream_with_context(stream_ffmpeg_process(cmd)), headers=headers)
+
+
+# ---------- Likes / Favorites / Search ----------
+def require_auth_api():
+    if g.user is None:
+        return jsonify({"ok": False, "error": "auth_required"}), 401
+    return None
+
+
+@app.route("/api/search")
+def api_search():
+    lang, _ = get_lang()
+    q = (request.args.get("q") or "").strip().lower()
+    sort_mode = request.args.get("sort") or "name"
+    if sort_mode not in SORT_MODES:
+        sort_mode = "name"
+    results = []
+    if q:
+        refresh_video_index()
+        is_admin = is_admin_request(request)
+        matches: List[Dict] = []
+        for base in list(VIDEO_INDEX.values()):
+            if not is_admin and get_protected_root_for(base["path"]) is not None:
+                continue
+            search_key = base.get(f"search_key_{lang}") or base_display_name(base, lang).lower()
+            if q in search_key:
+                matches.append(localized_video_entry(base, lang))
+        enrich_cards_with_stats(matches, include_favorites=True)
+        apply_sort(matches, sort_mode)
+        results = matches[:SEARCH_RESULT_LIMIT]
+    return jsonify({"results": results})
+
+
+@app.route("/api/state")
+def api_state():
+    resp = make_response()
+    get_user_cookie(resp)
+    path = request.args.get("path") or ""
+    author_param = normalize_author_name(request.args.get("author"))
+    counts = reaction_counts([path]).get(path, {"likes": 0, "dislikes": 0})
+    fav = False
+    reaction = None
+    author_subscribed = False
+    if g.user is not None and path:
+        reaction = user_reaction_for(path)
+        fav = is_favorite(path)
+    if g.user is not None and author_param:
+        author_subscribed = is_author_subscribed(author_param)
+    data = {
+        "likes": counts.get("likes", 0),
+        "dislikes": counts.get("dislikes", 0),
+        "user_reaction": reaction,
+        "favorite": fav,
+        "authenticated": g.user is not None,
+        "author_subscribed": author_subscribed
+    }
+    resp.set_data(json.dumps(data))
+    resp.mimetype = "application/json"
+    return resp
+
+
+@app.route("/api/like", methods=["POST"])
+def api_like():
+    need = require_auth_api()
+    if need: return need
+    if not allow_rate("react", 30, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+    data = request.get_json(force=True) or {}
+    path = data.get("path")
+    if not path:
+        return jsonify({"ok": False}), 400
+    db = get_db()
+    row = db.execute(
+        "SELECT reaction FROM reactions WHERE user_id = ? AND video_path = ?",
+        (g.user["id"], path)
+    ).fetchone()
+    if row and row["reaction"] == "like":
+        db.execute("DELETE FROM reactions WHERE user_id = ? AND video_path = ?", (g.user["id"], path))
+    else:
+        db.execute(
+            "INSERT INTO reactions (user_id, video_path, reaction) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, video_path) DO UPDATE SET reaction=excluded.reaction",
+            (g.user["id"], path, "like")
+        )
+    db.commit()
+    refresh_reaction_cache_for([path])
+    invalidate_collaborative_cache_for([path])
+    counts = reaction_counts([path])[path]
+    return jsonify({"ok": True, "likes": counts["likes"], "dislikes": counts["dislikes"], "user_reaction": user_reaction_for(path)})
+
+
+@app.route("/api/dislike", methods=["POST"])
+def api_dislike():
+    need = require_auth_api()
+    if need: return need
+    if not allow_rate("react", 30, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+    data = request.get_json(force=True) or {}
+    path = data.get("path")
+    if not path:
+        return jsonify({"ok": False}), 400
+    db = get_db()
+    row = db.execute(
+        "SELECT reaction FROM reactions WHERE user_id = ? AND video_path = ?",
+        (g.user["id"], path)
+    ).fetchone()
+    if row and row["reaction"] == "dislike":
+        db.execute("DELETE FROM reactions WHERE user_id = ? AND video_path = ?", (g.user["id"], path))
+    else:
+        db.execute(
+            "INSERT INTO reactions (user_id, video_path, reaction) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, video_path) DO UPDATE SET reaction=excluded.reaction",
+            (g.user["id"], path, "dislike")
+        )
+    db.commit()
+    refresh_reaction_cache_for([path])
+    invalidate_collaborative_cache_for([path])
+    counts = reaction_counts([path])[path]
+    return jsonify({"ok": True, "likes": counts["likes"], "dislikes": counts["dislikes"], "user_reaction": user_reaction_for(path)})
+
+
+@app.route("/api/favorite", methods=["POST"])
+def api_favorite():
+    need = require_auth_api()
+    if need: return need
+    if not allow_rate("favorite", 20, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+    data = request.get_json(force=True) or {}
+    path = data.get("path")
+    if not path:
+        return jsonify({"ok": False}), 400
+    db = get_db()
+    db.execute(
+        "INSERT INTO favorites (user_id, video_path) VALUES (?, ?) "
+        "ON CONFLICT(user_id, video_path) DO NOTHING",
+        (g.user["id"], path)
+    )
+    db.commit()
+    refresh_favorite_cache_for([path])
+    return jsonify({"ok": True, "favorite": True})
+
+
+@app.route("/api/unfavorite", methods=["POST"])
+def api_unfavorite():
+    need = require_auth_api()
+    if need: return need
+    if not allow_rate("favorite", 20, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+    data = request.get_json(force=True) or {}
+    path = data.get("path")
+    if not path:
+        return jsonify({"ok": False}), 400
+    db = get_db()
+    db.execute(
+        "DELETE FROM favorites WHERE user_id = ? AND video_path = ?",
+        (g.user["id"], path)
+    )
+    db.commit()
+    refresh_favorite_cache_for([path])
+    return jsonify({"ok": True, "favorite": False})
+
+
+@app.route("/api/shorts_feed")
+def api_shorts_feed():
+    lang, _ = get_lang()
+    sort_mode = resolve_sort_mode()
+    offset = request.args.get("offset", default=0, type=int) or 0
+    limit = request.args.get("limit", default=SHORTS_API_BATCH, type=int) or SHORTS_API_BATCH
+    if offset < 0:
+        offset = 0
+    limit = max(1, min(limit, 100))
+    entries = list_short_videos(lang)
+    enrich_cards_with_stats(entries, include_favorites=True)
+    apply_sort(entries, sort_mode)
+    total_count = len(entries)
+    slice_entries = entries[offset:offset + limit]
+    hydrate_short_entries(slice_entries)
+    payload = [serialize_short_entry(item) for item in slice_entries]
+    resp = jsonify({"items": payload, "total": total_count})
+    get_user_cookie(resp)
+    return resp
+
+
+@app.route("/api/shorts/view", methods=["POST"])
+def api_short_view():
+    data = request.get_json(silent=True) or {}
+    raw_path = data.get("path") or ""
+    path = normalize_rel_path(raw_path)
+    if not path:
+        return jsonify({"ok": False}), 400
+    refresh_video_index()
+    if not has_video_access(path):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    if path not in VIDEO_INDEX:
+        refresh_video_index(force=True)
+    if path not in VIDEO_INDEX:
+        return jsonify({"ok": False}), 404
+    resp = make_response()
+    if register_view_if_new(path, resp):
+        _views[path] = _views.get(path, 0) + 1
+        save_views()
+        mark_popular_dirty()
+    resp.set_data(json.dumps({"ok": True, "views": _views.get(path, 0)}))
+    resp.mimetype = "application/json"
+    return resp
+
+
+@app.route("/api/subscribe_author", methods=["POST"])
+def api_subscribe_author():
+    need = require_auth_api()
+    if need:
+        return need
+    if not allow_rate("subscribe", 30, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+    data = request.get_json(force=True) or {}
+    author = normalize_author_name(data.get("author"))
+    if not author:
+        return jsonify({"ok": False}), 400
+    db = get_db()
+    db.execute(
+        "INSERT INTO author_subscriptions (user_id, author) VALUES (?, ?) "
+        "ON CONFLICT(user_id, author) DO NOTHING",
+        (g.user["id"], author)
+    )
+    db.commit()
+    if hasattr(g, "_author_subscriptions") and isinstance(g._author_subscriptions, set):
+        g._author_subscriptions.add(author)
+    if hasattr(g, "_author_weights"):
+        delattr(g, "_author_weights")
+    return jsonify({"ok": True, "author": author, "subscribed": True})
+
+
+@app.route("/api/unsubscribe_author", methods=["POST"])
+def api_unsubscribe_author():
+    need = require_auth_api()
+    if need:
+        return need
+    if not allow_rate("subscribe", 30, 60):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+    data = request.get_json(force=True) or {}
+    author = normalize_author_name(data.get("author"))
+    if not author:
+        return jsonify({"ok": False}), 400
+    db = get_db()
+    db.execute(
+        "DELETE FROM author_subscriptions WHERE user_id = ? AND author = ?",
+        (g.user["id"], author)
+    )
+    db.commit()
+    if hasattr(g, "_author_subscriptions") and isinstance(g._author_subscriptions, set):
+        g._author_subscriptions.discard(author)
+    if hasattr(g, "_author_weights"):
+        delattr(g, "_author_weights")
+    return jsonify({"ok": True, "author": author, "subscribed": False})
+
+
+@app.route("/api/watch-progress", methods=["POST"])
+def api_watch_progress():
+    data = request.get_json(silent=True) or {}
+    path = data.get("path")
+    session_id = data.get("session")
+    seconds_val = data.get("seconds")
+    duration_hint = data.get("duration")
+    if not path or not session_id:
+        return jsonify({"ok": False, "error": "bad_request"}), 400
+    try:
+        seconds = float(seconds_val)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds <= 0:
+        return jsonify({"ok": True})
+    seconds = max(0.0, min(seconds, 7200.0))
+    fingerprint, user_id = viewer_identity()
+    get_user_cookie()
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return jsonify({"ok": False, "error": "bad_path"}), 400
+    refresh_video_index()
+    base = VIDEO_INDEX.get(normalized)
+    duration_seconds: float = 0.0
+    if base and base.get("duration_seconds") is not None:
+        duration_seconds = float(base.get("duration_seconds"))
+    else:
+        try:
+            duration_seconds = float(duration_hint or 0.0)
+        except (TypeError, ValueError):
+            duration_seconds = 0.0
+    db = get_db()
+    db.execute(
+        """
+        INSERT INTO watch_sessions (session_id, fingerprint, user_id, video_path, watched_seconds, duration_seconds, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(session_id) DO UPDATE SET
+            watched_seconds = watch_sessions.watched_seconds + ?,
+            duration_seconds = COALESCE(excluded.duration_seconds, watch_sessions.duration_seconds),
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (session_id, fingerprint, user_id, normalized, seconds, duration_seconds or None, seconds, duration_seconds or None),
+    )
+    row = db.execute(
+        "SELECT watched_seconds, duration_seconds, meaningful FROM watch_sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    total_seconds = row["watched_seconds"] if row else seconds
+    stored_duration = row["duration_seconds"] if row and row["duration_seconds"] is not None else duration_seconds
+    if user_id is not None:
+        _update_user_stats(db, user_id, seconds_delta=seconds, increment_view=False)
+    if row and not row["meaningful"] and is_meaningful_watch(total_seconds, stored_duration or 0.0):
+        db.execute("UPDATE watch_sessions SET meaningful = 1 WHERE session_id = ?", (session_id,))
+        record_transition(fingerprint, session_id, normalized)
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/favorites")
+@login_required
+def favorites_page():
+    lang, ui = get_lang()
+    db = get_db()
+    rows = db.execute(
+        "SELECT video_path FROM favorites WHERE user_id = ? ORDER BY created_at DESC",
+        (g.user["id"],)
+    ).fetchall()
+    items = []
+    for r in rows:
+        p = r["video_path"]
+        try:
+            full = safe_join(VIDEO_ROOT, p)
+        except Exception:
+            continue
+        if os.path.isfile(full):
+            entry = build_video_entry(full, lang)
+            if entry:
+                items.append(entry)
+    attach_secure_urls(items)
+    html = render_template_string(TEMPLATE_FAVORITES, items=items, lang=lang, ui=ui, current_user=g.user)
+    return html
+
+
+@app.route("/shorts")
+def shorts_page():
+    lang, ui = get_lang()
+    sort_mode = resolve_sort_mode()
+    sort_options = build_sort_options(ui)
+    entries = list_short_videos(lang)
+    enrich_cards_with_stats(entries, include_favorites=True)
+    apply_sort(entries, sort_mode)
+    total_count = len(entries)
+    initial_entries = entries[:SHORTS_INITIAL_BATCH]
+    hydrate_short_entries(initial_entries)
+    serialized = [serialize_short_entry(item) for item in initial_entries]
+    return render_template_string(
+        TEMPLATE_SHORTS,
+        lang=lang,
+        ui=ui,
+        current_user=g.user,
+        sort_mode=sort_mode,
+        sort_options=sort_options,
+        initial_shorts=serialized,
+        total_shorts=total_count,
+        shorts_batch=SHORTS_API_BATCH,
+    )
+
+
+@app.route("/upload", methods=["GET", "POST"])
+@login_required
+def upload_video():
+    lang, ui = get_lang()
+    db = get_db()
+    message = None
+    error = None
+    top_dirs = list_all_top_dirs()
+    if "community" not in top_dirs:
+        top_dirs.append("community")
+    top_dirs = sorted(set(top_dirs), key=str.lower)
+    default_folder = "community"
+
+    if request.method == "POST":
+        if not allow_rate("upload", 5, 3600):
+            error = ui["too_many_attempts"]
+        else:
+            file = request.files.get("video")
+            if not file or not file.filename:
+                error = ui["upload_error"]
+            else:
+                ext = os.path.splitext(file.filename)[1].lower()
+                if ext not in ALLOWED_EXT:
+                    error = ui["upload_error"]
+                else:
+                    target_folder = request.form.get("target_folder", "") or "community"
+                    custom_folder = request.form.get("custom_folder", "").strip()
+                    if custom_folder:
+                        target_folder = custom_folder
+                    target_folder = sanitize_folder_name(target_folder)
+                    stored_name = f"{int(time.time())}_{g.user['id']}_{uuid.uuid4().hex[:8]}{ext}"
+                    stored_path = os.path.join(UPLOAD_ROOT, stored_name)
+                    original_name = sanitize_filename(file.filename)
+                    try:
+                        file.save(stored_path)
+                        size_bytes = os.path.getsize(stored_path)
+                        db.execute(
+                            "INSERT INTO uploads (user_id, stored_name, original_name, target_folder, status, size_bytes) "
+                            "VALUES (?, ?, ?, ?, 'pending', ?)",
+                            (g.user["id"], stored_name, original_name, target_folder, size_bytes)
+                        )
+                        db.commit()
+                        message = ui["upload_success"]
+                        default_folder = target_folder.split("/")[0] if target_folder else "community"
+                    except Exception:
+                        error = ui["upload_error"]
+                        try:
+                            if os.path.exists(stored_path):
+                                os.remove(stored_path)
+                        except Exception:
+                            pass
+
+    history_rows = db.execute(
+        "SELECT id, original_name, target_folder, status, notes, created_at "
+        "FROM uploads WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+        (g.user["id"],)
+    ).fetchall()
+    history = [dict(row) for row in history_rows]
+
+    return render_template_string(
+        TEMPLATE_UPLOAD,
+        lang=lang, ui=ui, message=message, error=error,
+        top_dirs=top_dirs, history=history, default_folder=default_folder,
+        current_user=g.user
+    )
+
+
+@app.route("/account/stats")
+@login_required
+def account_stats():
+    lang, ui = get_lang()
+    db = get_db()
+    stats_row = db.execute(
+        "SELECT views_count, seconds_watched, last_view_at FROM user_stats WHERE user_id = ?",
+        (g.user["id"],)
+    ).fetchone()
+    views = stats_row["views_count"] if stats_row else 0
+    seconds = stats_row["seconds_watched"] if stats_row else 0.0
+    minutes = seconds / 60.0
+    avg = (minutes / views) if views else 0.0
+    favorites = db.execute(
+        "SELECT COUNT(*) FROM favorites WHERE user_id = ?",
+        (g.user["id"],)
+    ).fetchone()[0]
+    uploads_counts = {"pending": 0, "approved": 0, "rejected": 0}
+    for row in db.execute(
+        "SELECT status, COUNT(*) AS cnt FROM uploads WHERE user_id = ? GROUP BY status",
+        (g.user["id"],)
+    ):
+        uploads_counts[row["status"]] = row["cnt"]
+    uploads_rows = db.execute(
+        "SELECT original_name, target_folder, status, notes, created_at, reviewed_at "
+        "FROM uploads WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+        (g.user["id"],)
+    ).fetchall()
+    uploads = [dict(row) for row in uploads_rows]
+    stats = {
+        "views": views,
+        "minutes": f"{minutes:.1f}",
+        "avg": f"{avg:.2f}",
+        "favorites": favorites,
+        "last_view": stats_row["last_view_at"] if stats_row else None
+    }
+    return render_template_string(
+        TEMPLATE_ACCOUNT_STATS,
+        lang=lang, ui=ui, stats=stats, uploads_counts=uploads_counts,
+        uploads=uploads, current_user=g.user
+    )
+
+
+@app.route("/admin/panel")
+@login_required
+@admin_required
+def admin_panel():
+    lang, ui = get_lang()
+    refresh_video_index()
+    db = get_db()
+    total_users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    pending_count = db.execute("SELECT COUNT(*) FROM uploads WHERE status='pending'").fetchone()[0]
+    summary = {"videos": len(VIDEO_INDEX), "users": total_users, "pending": pending_count}
+
+    stats_rows = db.execute(
+        "SELECT user_id, views_count, seconds_watched, last_view_at FROM user_stats"
+    ).fetchall()
+    stats_map = {row["user_id"]: row for row in stats_rows}
+    fav_rows = db.execute(
+        "SELECT user_id, COUNT(*) AS cnt FROM favorites GROUP BY user_id"
+    ).fetchall()
+    fav_map = {row["user_id"]: row["cnt"] for row in fav_rows}
+    user_rows = db.execute(
+        "SELECT id, username, is_admin, is_moderator FROM users ORDER BY lower(username)"
+    ).fetchall()
+    users = []
+    for row in user_rows:
+        stat = stats_map.get(row["id"])
+        views = stat["views_count"] if stat else 0
+        seconds = stat["seconds_watched"] if stat else 0.0
+        minutes = seconds / 60.0
+        avg = (minutes / views) if views else 0.0
+        users.append({
+            "id": row["id"],
+            "username": row["username"],
+            "is_admin": bool(row["is_admin"]),
+            "is_moderator": bool(row["is_moderator"]),
+            "views": views,
+            "minutes": f"{minutes:.1f}",
+            "favorites": fav_map.get(row["id"], 0),
+            "last_view": stat["last_view_at"] if stat else None
+        })
+
+    pending_rows = db.execute(
+        "SELECT uploads.id, uploads.original_name, uploads.target_folder, uploads.created_at, uploads.size_bytes, "
+        "users.username FROM uploads JOIN users ON users.id = uploads.user_id "
+        "WHERE uploads.status='pending' ORDER BY uploads.created_at ASC"
+    ).fetchall()
+    pending_uploads = []
+    for row in pending_rows:
+        size_mb = (row["size_bytes"] or 0) / (1024 * 1024)
+        pending_uploads.append({
+            "id": row["id"],
+            "original_name": row["original_name"],
+            "target_folder": row["target_folder"] or "community",
+            "created_at": row["created_at"],
+            "size_mb": size_mb,
+            "username": row["username"]
+        })
+
+    return render_template_string(
+        TEMPLATE_ADMIN_PANEL,
+        lang=lang, ui=ui, summary=summary, users=users,
+        pending_uploads=pending_uploads, current_user=g.user
+    )
+
+
+@app.route("/moderator/panel")
+@login_required
+@moderator_required
+def moderator_panel():
+    lang, ui = get_lang()
+    db = get_db()
+    pending_rows = db.execute(
+        "SELECT uploads.id, uploads.original_name, uploads.target_folder, uploads.created_at, uploads.size_bytes, "
+        "users.username FROM uploads JOIN users ON users.id = uploads.user_id "
+        "WHERE uploads.status='pending' ORDER BY uploads.created_at ASC"
+    ).fetchall()
+    pending_uploads = []
+    for row in pending_rows:
+        pending_uploads.append({
+            "id": row["id"],
+            "original_name": row["original_name"],
+            "target_folder": row["target_folder"] or "community",
+            "created_at": row["created_at"],
+            "size_mb": (row["size_bytes"] or 0) / (1024 * 1024),
+            "username": row["username"]
+        })
+    recent_rows = db.execute(
+        "SELECT original_name, status, notes, created_at, reviewed_at FROM uploads "
+        "WHERE moderator_id = ? ORDER BY COALESCE(reviewed_at, created_at) DESC LIMIT 30",
+        (g.user["id"],)
+    ).fetchall()
+    recent_reviews = [dict(row) for row in recent_rows]
+    return render_template_string(
+        TEMPLATE_MOD_PANEL,
+        lang=lang, ui=ui, pending_uploads=pending_uploads,
+        recent_reviews=recent_reviews, current_user=g.user
+    )
+
+
+@app.route("/admin/moderators/<int:user_id>", methods=["POST"])
+@login_required
+@admin_required
+def toggle_moderator(user_id: int):
+    action = request.form.get("action")
+    next_url = request.form.get("next") or url_for("admin_panel")
+    if user_id == g.user["id"]:
+        return redirect(next_url)
+    db = get_db()
+    if action == "promote":
+        db.execute("UPDATE users SET is_moderator = 1 WHERE id = ?", (user_id,))
+    elif action == "demote":
+        db.execute("UPDATE users SET is_moderator = 0 WHERE id = ?", (user_id,))
+    db.commit()
+    return redirect(next_url)
+
+
+@app.route("/moderation/uploads/<int:upload_id>/file")
+@login_required
+@moderator_required
+def download_pending_upload(upload_id: int):
+    db = get_db()
+    row = db.execute(
+        "SELECT stored_name, original_name FROM uploads WHERE id = ?",
+        (upload_id,)
+    ).fetchone()
+    if row is None:
+        abort(404)
+    path = os.path.join(UPLOAD_ROOT, row["stored_name"])
+    if not os.path.exists(path):
+        abort(404)
+    return send_file(path, as_attachment=True, download_name=row["original_name"])
+
+
+def _finalize_destination(target_folder: str, original_name: str) -> Tuple[str, str]:
+    clean_folder = sanitize_folder_name(target_folder)
+    dest_dir = safe_join(VIDEO_ROOT, clean_folder)
+    os.makedirs(dest_dir, exist_ok=True)
+    base_name = sanitize_filename(original_name)
+    base, ext = os.path.splitext(base_name)
+    ext = ext or ".mp4"
+    candidate = base_name
+    dest_path = os.path.join(dest_dir, candidate)
+    counter = 1
+    while os.path.exists(dest_path):
+        candidate = f"{base}_{counter}{ext}"
+        dest_path = os.path.join(dest_dir, candidate)
+        counter += 1
+    rel_path = normalize_rel_path(os.path.relpath(dest_path, VIDEO_ROOT))
+    return dest_path, rel_path
+
+
+@app.route("/moderation/uploads/<int:upload_id>/approve", methods=["POST"])
+@login_required
+@moderator_required
+def approve_upload(upload_id: int):
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM uploads WHERE id = ? AND status = 'pending'",
+        (upload_id,)
+    ).fetchone()
+    if row is None:
+        abort(404)
+    target_folder = request.form.get("target_folder", row["target_folder"] or "community")
+    notes = (request.form.get("notes") or "").strip()
+    source_path = os.path.join(UPLOAD_ROOT, row["stored_name"])
+    if not os.path.exists(source_path):
+        abort(404)
+    dest_path, rel_path = _finalize_destination(target_folder, row["original_name"])
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    os.replace(source_path, dest_path)
+    size_bytes = os.path.getsize(dest_path)
+    duration_seconds = ffprobe_duration(dest_path)
+    generate_thumbnail(dest_path)
+    author_row = db.execute(
+        "SELECT username FROM users WHERE id = ?",
+        (row["user_id"],),
+    ).fetchone()
+    author_name = (author_row["username"].strip() if author_row and author_row["username"] else None)
+    set_video_author_override(rel_path, author_name, db=db)
+    refresh_video_index(force=True)
+    db.execute(
+        "UPDATE uploads SET status='approved', moderator_id=?, notes=?, target_folder=?, final_path=?, "
+        "duration_seconds=?, size_bytes=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+        (g.user["id"], notes, sanitize_folder_name(target_folder), rel_path, duration_seconds, size_bytes, upload_id)
+    )
+    db.commit()
+    next_url = request.form.get("next") or url_for("moderator_panel")
+    return redirect(next_url)
+
+
+@app.route("/moderation/uploads/<int:upload_id>/reject", methods=["POST"])
+@login_required
+@moderator_required
+def reject_upload(upload_id: int):
+    db = get_db()
+    row = db.execute(
+        "SELECT stored_name FROM uploads WHERE id = ?",
+        (upload_id,)
+    ).fetchone()
+    if row is None:
+        abort(404)
+    notes = (request.form.get("notes") or "").strip()
+    source_path = os.path.join(UPLOAD_ROOT, row["stored_name"])
+    if os.path.exists(source_path):
+        try:
+            os.remove(source_path)
+        except Exception:
+            pass
+    db.execute(
+        "UPDATE uploads SET status='rejected', moderator_id=?, notes=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+        (g.user["id"], notes, upload_id)
+    )
+    db.commit()
+    next_url = request.form.get("next") or url_for("moderator_panel")
+    return redirect(next_url)
+
+@app.route("/random")
+def random_video():
+    refresh_video_index()
+    selected_dirs = set(normalize_rel_path(x) for x in get_random_dirs_from_cookie() if x)
+    is_admin = is_admin_request(request)
+    candidates: List[str] = []
+    for rel in VIDEO_INDEX.keys():
+        top = rel.split("/", 1)[0] if rel else rel
+        top_normalized = normalize_rel_path(top)
+        if selected_dirs and top_normalized not in selected_dirs:
+            continue
+        scope = get_protected_root_for(rel)
+        if scope and not (is_admin or user_has_persistent_access(scope)):
+            continue
+        candidates.append(rel)
+    if not candidates:
+        return redirect(url_for("browse", subpath=""))
+    video_path = random.choice(candidates)
+    scope = get_protected_root_for(video_path)
+    return redirect(with_grant(url_for("watch_video", filepath=video_path), scope))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    lang, ui = get_lang()
+    if g.user:
+        return redirect(request.args.get("next") or url_for("browse", subpath=""))
+    error = None
+    next_url = request.args.get("next") or request.form.get("next") or url_for("browse", subpath="")
+    if request.method == "POST":
+        if not allow_rate("login", 5, 60):
+            error = ui["too_many_attempts"]
+        else:
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+            db = get_db()
+            row = db.execute("SELECT id, username, password_hash, is_admin FROM users WHERE lower(username) = lower(?)", (username,)).fetchone()
+            if row and check_password_hash(row["password_hash"], password):
+                session.clear()
+                session["user_id"] = row["id"]
+                return redirect(next_url)
+            else:
+                error = "Неверный логин или пароль" if lang == "ru" else "Invalid credentials"
+    alt = ui["register"] + f"? <a href=\"{url_for('register', next=next_url)}\">{ui['register']}</a>"
+    return render_template_string(
+        TEMPLATE_AUTH,
+        title=ui["login"], error=error, next_url=next_url,
+        username_label="Логин" if lang == "ru" else "Username",
+        password_label="Пароль" if lang == "ru" else "Password",
+        confirm_label="" , show_confirm=False,
+        submit_label=ui["login"], alt_text=alt, ui=ui
+    )
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    lang, ui = get_lang()
+    if g.user:
+        return redirect(request.args.get("next") or url_for("browse", subpath=""))
+    error = None
+    next_url = request.args.get("next") or request.form.get("next") or url_for("browse", subpath="")
+    if request.method == "POST":
+        if not allow_rate("register", 3, 300):
+            error = ui["too_many_attempts"]
+        else:
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+            password_confirm = request.form.get("password_confirm", "")
+            if not username or not password:
+                error = "Заполните все поля" if lang == "ru" else "Fill all fields"
+            elif password != password_confirm:
+                error = "Пароли не совпадают" if lang == "ru" else "Passwords do not match"
+            else:
+                db = get_db()
+                exists = db.execute("SELECT 1 FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
+                if exists:
+                    error = "Логин уже используется" if lang == "ru" else "Username already taken"
+                else:
+                    db.execute(
+                        "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 0)",
+                        (username, generate_password_hash(password))
+                    )
+                    db.commit()
+                    row = db.execute("SELECT id FROM users WHERE lower(username)=lower(?)", (username,)).fetchone()
+                    session.clear()
+                    session["user_id"] = row["id"]
+                    return redirect(next_url)
+    alt = ui["login"] + f"? <a href=\"{url_for('login', next=next_url)}\">{ui['login']}</a>"
+    return render_template_string(
+        TEMPLATE_AUTH,
+        title=ui["register"], error=error, next_url=next_url,
+        username_label="Логин" if lang == "ru" else "Username",
+        password_label="Пароль" if lang == "ru" else "Password",
+        confirm_label="Повторите пароль" if lang == "ru" else "Confirm password",
+        show_confirm=True,
+        submit_label=ui["register"], alt_text=alt, ui=ui
+    )
+
+
+@app.route("/logout")
+def logout():
+    next_url = request.args.get("next") or url_for("browse", subpath="")
+    session.clear()
+    return redirect(next_url)
+
+
+# ---------- Admin ----------
+@app.route("/admin/protect", methods=["GET", "POST"])
+@login_required
+def admin_protect():
+    if not g.user.get("is_admin"):
+        abort(403)
+    folders = []
+    for root, dirs, files in os.walk(VIDEO_ROOT):
+        for d in dirs:
+            if d.startswith("__"): continue
+            rel = os.path.relpath(os.path.join(root, d), VIDEO_ROOT).replace("\\", "/")
+            folders.append(rel)
+    folders.sort(key=str.lower)
+
+    if request.method == "POST":
+        act = request.form.get("action")
+        fld = request.form.get("folder")
+        if act == "add":
+            pw = request.form.get("password", "")
+            if pw:
+                clear_folder_access(fld)
+                _protected[fld] = hashlib.sha256(pw.encode()).hexdigest(); save_protected()
+        elif act == "remove":
+            _protected.pop(fld, None); save_protected()
+            clear_folder_access(fld)
+        return redirect(url_for("admin_protect"))
+
+    return render_template_string(TEMPLATE_PROTECT, folders=folders, protected=_protected)
+
+
+# ---------- Fix / Delete ----------
+def ffmpeg_check(video_path: str, timeout: int = FFMPEG_CHECK_TIMEOUT) -> bool:
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v","error",
+                "-select_streams","v:0",
+                "-show_entries","stream=codec_type",
+                "-of","default=noprint_wrappers=1:nokey=1",
+                video_path
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(10, min(timeout, 300))
+        )
+        if probe.returncode == 0:
+            return True
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        return False
+
+    try:
+        res = subprocess.run(
+            ["ffmpeg","-v","error","-i",video_path,"-f","null","-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout
+        )
+        if res.returncode != 0:
+            return False
+        err_output = (res.stderr or b"").decode(errors="ignore").strip()
+        return not err_output
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return False
+    return False
+
+
+def ffmpeg_fix(video_path: str) -> bool:
+    rel_path = os.path.relpath(video_path, VIDEO_ROOT).replace("\\", "/")
+    attempt_specs = [
+        (
+            lambda tmp: [
+                "ffmpeg","-y","-fflags","+genpts","-i",video_path,
+                "-map","0","-c","copy","-movflags","+faststart", tmp
+            ],
+            FFMPEG_FIX_COPY_TIMEOUT
+        ),
+        (
+            lambda tmp: [
+                "ffmpeg","-y","-i",video_path,
+                "-map","0:v:0","-map","0:a:0?","-map","0:s?",
+                "-c:v","libx264","-preset","veryfast","-crf","20",
+                "-c:a","aac","-b:a","192k",
+                "-movflags","+faststart", tmp
+            ],
+            FFMPEG_FIX_TRANSCODE_TIMEOUT
+        )
+    ]
+
+    for idx, (builder, timeout) in enumerate(attempt_specs, start=1):
+        tmp_path = f"{video_path}.fix{idx}.mp4"
+        try:
+            result = subprocess.run(
+                builder(tmp_path),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False
+            )
+            if result.returncode != 0:
+                continue
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                continue
+            if not ffmpeg_check(tmp_path):
+                continue
+            os.replace(tmp_path, video_path)
+            _dur_cache.pop(rel_path, None)
+            save_dur_cache()
+            thumb = os.path.splitext(video_path)[0] + ".jpg"
+            try:
+                if os.path.exists(thumb):
+                    os.remove(thumb)
+            except Exception:
+                pass
+            try:
+                preview_rel = os.path.splitext(os.path.relpath(video_path, VIDEO_ROOT))[0] + ".preview.mp4"
+                preview_abs = os.path.join(PREVIEW_ROOT, preview_rel)
+                if os.path.exists(preview_abs):
+                    os.remove(preview_abs)
+            except Exception:
+                pass
+            try:
+                generate_thumbnail(video_path)
+            except Exception:
+                pass
+            try:
+                ensure_preview(video_path)
+            except Exception:
+                pass
+            return True
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            continue
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+    return False
+
+
+@app.route("/admin/checkfix/<path:filepath>")
+@login_required
+def admin_checkfix(filepath):
+    if not g.user.get("is_admin"):
+        abort(403)
+    full = safe_join(VIDEO_ROOT, filepath)
+    if not os.path.isfile(full): abort(404)
+    ok = ffmpeg_check(full)
+    if not ok: ffmpeg_fix(full)
+    return redirect(url_for("watch_video", filepath=filepath))
+
+
+@app.route("/admin/delete/<path:filepath>")
+@login_required
+def admin_delete(filepath):
+    if not g.user.get("is_admin"):
+        abort(403)
+    full = safe_join(VIDEO_ROOT, filepath)
+    if os.path.isfile(full):
+        try:
+            os.remove(full)
+            thumb = os.path.splitext(full)[0] + ".jpg"
+            if os.path.exists(thumb): os.remove(thumb)
+            prv_rel = os.path.splitext(os.path.relpath(full, VIDEO_ROOT))[0] + ".preview.mp4"
+            prv_abs = os.path.join(PREVIEW_ROOT, prv_rel)
+            if os.path.exists(prv_abs): os.remove(prv_abs)
+            _views.pop(filepath, None); save_views()
+            mark_popular_dirty()
+            REACTION_CACHE.pop(filepath, None)
+            FAVORITE_CACHE.pop(filepath, None)
+            db = get_db()
+            db.execute("DELETE FROM reactions WHERE video_path = ?", (filepath,))
+            db.execute("DELETE FROM favorites WHERE video_path = ?", (filepath,))
+            db.execute("DELETE FROM view_events WHERE video_path = ?", (filepath,))
+            db.execute("DELETE FROM watch_sessions WHERE video_path = ?", (filepath,))
+            db.execute("DELETE FROM video_transitions WHERE from_path = ? OR to_path = ?", (filepath, filepath))
+            db.execute("UPDATE watch_cursor SET last_video_path = NULL WHERE last_video_path = ?", (filepath,))
+            remove_author_overrides([filepath], db=db, autocommit=False)
+            db.commit()
+            invalidate_transition_cache_for([filepath])
+            invalidate_collaborative_cache_for([filepath])
+        except Exception as e:
+            print("Ошибка удаления:", e)
+    return redirect(url_for("browse", subpath=os.path.dirname(filepath)))
+
+
+# -------------------------
+# CLI / STARTUP
+# -------------------------
+
+
+def print_startup_banner() -> None:
+    print(f"📂 Видео-каталог: {VIDEO_ROOT}")
+    print(f"📂 Превью-каталог: {PREVIEW_ROOT}")
+    print(f"🗂 Кэш: translations.json, durations.json, views.json, protected_folders.json")
+    print(f"🗄️ SQLite: {DATABASE_PATH}")
+    print(f"🔐 Admin username: {ADMIN_USERNAME}")
+    print(f"🔏 Access token TTL: {ACCESS_TOKEN_TTL_SEC}s (HMAC in query)")
+
+
+def cli_rebuild_index() -> None:
+    print("[worker] refreshing metadata index…")
+    refresh_video_index(force=True)
+    mark_popular_dirty()
+    print("[worker] index refreshed.")
+
+
+def cli_generate_previews(workers: int) -> None:
+    refresh_video_index(force=True)
+    video_paths = list(iter_video_files(VIDEO_ROOT))
+    total = len(video_paths)
+    if not total:
+        print("[worker] nothing to do — no videos found.")
+        return
+    workers = max(1, workers)
+    print(f"[worker] generating previews for {total} videos using {workers} worker(s)…")
+
+    def task(path: str) -> None:
+        try:
+            ensure_preview(path)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            print(f"[worker] failed to generate preview for {path}: {exc}")
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for _ in executor.map(task, video_paths):
+            completed += 1
+            if completed % 25 == 0 or completed == total:
+                print(f"[worker] {completed}/{total} previews ready")
+    print("[worker] preview generation finished.")
+
+
+def run_server() -> None:
+    print_startup_banner()
+    print("▶️ Запуск на http://0.0.0.0:8000")
+    app.run(host="0.0.0.0", port=8000, debug=True)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Video site server and maintenance utilities")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["serve", "index", "previews", "all"],
+        help="Task to run: start the server (default), rebuild the index, generate previews, or run both maintenance tasks.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="Number of parallel workers when generating previews (default: CPU count).",
+    )
+    args = parser.parse_args(argv)
+
+    command = args.command or "serve"
+    if command == "serve":
+        run_server()
+        return 0
+
+    if command in {"index", "all"}:
+        cli_rebuild_index()
+    if command in {"previews", "all"}:
+        cli_generate_previews(args.workers)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entrypoint
+    raise SystemExit(main())
