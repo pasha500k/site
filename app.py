@@ -111,6 +111,12 @@ POPULAR_CACHE_MAX = 600
 TRANSITION_CACHE: Dict[Tuple[str, str], List[Tuple[str, float]]] = {}
 TRANSITION_CACHE_LOCK = threading.Lock()
 
+# cached collaborative signals (per video) -> (timestamp, watch_list, reaction_list)
+COLLAB_CACHE: Dict[str, Tuple[float, List[Tuple[str, float]], List[Tuple[str, float]]]] = {}
+COLLAB_CACHE_TTL = 180.0
+COLLAB_CACHE_MAX = 800
+COLLAB_CACHE_LOCK = threading.Lock()
+
 
 def mark_popular_dirty() -> None:
     global POPULAR_CACHE_DIRTY
@@ -406,6 +412,15 @@ def invalidate_transition_cache_for(paths: Iterable[str]) -> None:
             TRANSITION_CACHE.pop(key, None)
 
 
+def invalidate_collaborative_cache_for(paths: Iterable[str]) -> None:
+    normalized = {normalize_rel_path(p) for p in paths if p}
+    if not normalized:
+        return
+    with COLLAB_CACHE_LOCK:
+        for key in normalized:
+            COLLAB_CACHE.pop(key, None)
+
+
 def fetch_transition_list(kind: str, path: str, limit: int = 200) -> List[Tuple[str, float]]:
     normalized = normalize_rel_path(path)
     if not normalized:
@@ -448,6 +463,137 @@ def get_sequence_neighbors(path: str, limit: int = 400) -> Dict[str, float]:
     return neighbors
 
 
+def _compute_watch_collaborations(normalized: str, limit: int) -> List[Tuple[str, float]]:
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT
+            ws_other.video_path AS neighbor,
+            SUM(CASE WHEN ws_other.meaningful = 1 THEN 1 ELSE 0 END) AS meaningful_count,
+            SUM(COALESCE(ws_other.watched_seconds, 0)) AS total_seconds,
+            COUNT(*) AS overlap
+        FROM watch_sessions AS ws_current
+        JOIN watch_sessions AS ws_other
+          ON ws_current.user_id = ws_other.user_id
+        WHERE ws_current.video_path = ?
+          AND ws_other.video_path IS NOT NULL
+          AND ws_other.video_path != ?
+          AND ws_current.user_id IS NOT NULL
+          AND ws_current.meaningful = 1
+        GROUP BY ws_other.video_path
+        ORDER BY meaningful_count DESC, total_seconds DESC
+        LIMIT ?
+        """,
+        (normalized, normalized, limit),
+    ).fetchall()
+    results: List[Tuple[str, float]] = []
+    for row in rows:
+        neighbor = normalize_rel_path(row["neighbor"])
+        if not neighbor or neighbor == normalized:
+            continue
+        meaningful_count = float(row["meaningful_count"] or 0.0)
+        total_seconds = float(row["total_seconds"] or 0.0)
+        overlap = float(row["overlap"] or 0.0)
+        weight = meaningful_count * 4.0 + overlap * 0.75 + (total_seconds / 180.0)
+        if weight <= 0.0:
+            continue
+        results.append((neighbor, weight))
+    return results
+
+
+def _compute_reaction_collaborations(normalized: str, limit: int) -> List[Tuple[str, float]]:
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT
+            r2.video_path AS neighbor,
+            SUM(
+                CASE
+                    WHEN r1.reaction = 'like' AND r2.reaction = 'like' THEN 2.0
+                    WHEN r1.reaction = 'like' AND r2.reaction = 'dislike' THEN -1.2
+                    WHEN r1.reaction = 'dislike' AND r2.reaction = 'like' THEN 0.8
+                    ELSE -0.6
+                END
+            ) AS raw_score,
+            SUM(CASE WHEN r2.reaction = 'like' THEN 1 ELSE 0 END) AS like_count,
+            SUM(CASE WHEN r2.reaction = 'dislike' THEN 1 ELSE 0 END) AS dislike_count,
+            COUNT(*) AS overlap
+        FROM reactions AS r1
+        JOIN reactions AS r2 ON r1.user_id = r2.user_id
+        WHERE r1.video_path = ?
+          AND r2.video_path IS NOT NULL
+          AND r2.video_path != ?
+        GROUP BY r2.video_path
+        ORDER BY raw_score DESC
+        LIMIT ?
+        """,
+        (normalized, normalized, limit),
+    ).fetchall()
+    results: List[Tuple[str, float]] = []
+    for row in rows:
+        neighbor = normalize_rel_path(row["neighbor"])
+        if not neighbor or neighbor == normalized:
+            continue
+        raw_score = float(row["raw_score"] or 0.0)
+        like_count = float(row["like_count"] or 0.0)
+        dislike_count = float(row["dislike_count"] or 0.0)
+        overlap = float(row["overlap"] or 0.0)
+        weight = raw_score + like_count * 0.25 - dislike_count * 0.35 + overlap * 0.15
+        results.append((neighbor, weight))
+    return results
+
+
+def get_collaborative_scores(path: str, limit: int = 400) -> Tuple[Dict[str, float], Dict[str, float]]:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return {}, {}
+    now = time.time()
+    with COLLAB_CACHE_LOCK:
+        cached = COLLAB_CACHE.get(normalized)
+        if cached and (now - cached[0]) < COLLAB_CACHE_TTL:
+            watch_list, reaction_list = cached[1], cached[2]
+        else:
+            watch_list = _compute_watch_collaborations(normalized, COLLAB_CACHE_MAX)
+            reaction_list = _compute_reaction_collaborations(normalized, COLLAB_CACHE_MAX)
+            COLLAB_CACHE[normalized] = (now, watch_list, reaction_list)
+    watch_dict = dict(watch_list[:limit])
+    reaction_dict = dict(reaction_list[:limit])
+    return watch_dict, reaction_dict
+
+
+def walk_transition_scores(path: str, depth: int = 3, branch: int = 18, decay: float = 0.82) -> Dict[str, float]:
+    normalized = normalize_rel_path(path)
+    if not normalized:
+        return {}
+    scores: Dict[str, float] = {}
+    frontier: Dict[str, float] = {normalized: 1.0}
+    visited: Set[str] = set()
+    for _ in range(depth):
+        next_frontier: Dict[str, float] = {}
+        for node, weight in frontier.items():
+            neighbors = fetch_transition_list("out", node, branch) + fetch_transition_list("in", node, branch)
+            if not neighbors:
+                continue
+            total = sum(max(float(w), 0.0) for _, w in neighbors)
+            if total <= 0.0:
+                continue
+            for neighbor, edge_weight in neighbors:
+                neighbor_norm = normalize_rel_path(neighbor)
+                if not neighbor_norm or neighbor_norm == normalized:
+                    continue
+                portion = max(float(edge_weight), 0.0) / total
+                propagated = weight * decay * portion
+                if propagated <= 0.0:
+                    continue
+                scores[neighbor_norm] = scores.get(neighbor_norm, 0.0) + propagated
+                next_frontier[neighbor_norm] = next_frontier.get(neighbor_norm, 0.0) + propagated
+        frontier = {node: w for node, w in next_frontier.items() if node not in visited}
+        visited.update(frontier.keys())
+        if not frontier:
+            break
+    return scores
+
+
 def record_transition(fingerprint: str, session_id: str, video_path: str) -> None:
     normalized = normalize_rel_path(video_path)
     if not normalized:
@@ -470,6 +616,7 @@ def record_transition(fingerprint: str, session_id: str, video_path: str) -> Non
             (previous, normalized),
         )
         invalidate_transition_cache_for([previous, normalized])
+        invalidate_collaborative_cache_for([previous, normalized])
     db.execute(
         """
         INSERT INTO watch_cursor (fingerprint, last_video_path, last_session_id, updated_at)
@@ -481,6 +628,7 @@ def record_transition(fingerprint: str, session_id: str, video_path: str) -> Non
         """,
         (fingerprint, normalized, session_id),
     )
+    invalidate_collaborative_cache_for([normalized])
 
 
 def is_meaningful_watch(watched_seconds: float, duration_seconds: float) -> bool:
@@ -1416,6 +1564,7 @@ def refresh_video_index(force: bool = False) -> None:
             remove_author_overrides(removed_overrides)
         if removed_paths:
             invalidate_transition_cache_for(removed_paths)
+            invalidate_collaborative_cache_for(removed_paths)
             if removed_paths:
                 close_conn = False
                 if has_app_context():
@@ -1562,6 +1711,8 @@ def build_recommendation_pool(current_path: str, lang: str, current_author: Opti
     candidate_paths: List[str] = []
     seen: set = set()
     sequence_scores = get_sequence_neighbors(current_path, limit=desired * 2)
+    walk_scores = walk_transition_scores(current_path, depth=3, branch=20, decay=0.83)
+    collab_watch_scores, collab_reaction_scores = get_collaborative_scores(current_path, limit=desired * 2)
 
     def add_candidate(raw_path: str, *, allow_same_dir: bool = False) -> None:
         normalized = normalize_rel_path(raw_path)
@@ -1570,7 +1721,13 @@ def build_recommendation_pool(current_path: str, lang: str, current_author: Opti
         if normalized not in VIDEO_INDEX:
             return
         if not allow_same_dir and current_dir_prefix and normalized.startswith(current_dir_prefix):
-            if sequence_scores.get(normalized, 0.0) <= 0.0:
+            strongest_signal = max(
+                sequence_scores.get(normalized, 0.0),
+                walk_scores.get(normalized, 0.0),
+                collab_watch_scores.get(normalized, 0.0),
+                collab_reaction_scores.get(normalized, 0.0),
+            )
+            if strongest_signal <= 0.0:
                 return
         candidate_paths.append(normalized)
         seen.add(normalized)
@@ -1579,6 +1736,30 @@ def build_recommendation_pool(current_path: str, lang: str, current_author: Opti
         add_candidate(path, allow_same_dir=True)
         if len(candidate_paths) >= desired:
             break
+
+    if len(candidate_paths) < desired:
+        for path, _ in sorted(walk_scores.items(), key=lambda item: item[1], reverse=True):
+            if _ <= 0.0:
+                continue
+            add_candidate(path)
+            if len(candidate_paths) >= desired:
+                break
+
+    if len(candidate_paths) < desired:
+        for path, _ in sorted(collab_watch_scores.items(), key=lambda item: item[1], reverse=True):
+            if _ <= 0.0:
+                continue
+            add_candidate(path, allow_same_dir=True)
+            if len(candidate_paths) >= desired:
+                break
+
+    if len(candidate_paths) < desired:
+        for path, _ in sorted(collab_reaction_scores.items(), key=lambda item: item[1], reverse=True):
+            if _ <= 0.0:
+                continue
+            add_candidate(path, allow_same_dir=True)
+            if len(candidate_paths) >= desired:
+                break
 
     if len(candidate_paths) < desired and current_author:
         for path in AUTHOR_VIDEO_INDEX.get(current_author, []):
@@ -1605,8 +1786,12 @@ def build_recommendation_pool(current_path: str, lang: str, current_author: Opti
                 break
 
     entries = collect_video_entries(candidate_paths, lang)
+    enrich_cards_with_stats(entries, include_favorites=True)
     for entry in entries:
         entry["_sequence_weight"] = sequence_scores.get(entry["path"], 0.0)
+        entry["_walk_weight"] = walk_scores.get(entry["path"], 0.0)
+        entry["_collab_watch"] = collab_watch_scores.get(entry["path"], 0.0)
+        entry["_collab_react"] = collab_reaction_scores.get(entry["path"], 0.0)
     return entries
 
 
@@ -1618,6 +1803,10 @@ def compute_recommendation_score(
     watched_paths: Optional[Set[str]] = None,
     now_ts: Optional[float] = None,
     max_sequence_weight: float = 0.0,
+    max_collab_watch: float = 0.0,
+    max_collab_react: float = 0.0,
+    max_walk_weight: float = 0.0,
+    duration_pref: Optional[float] = None,
 ) -> float:
     score = 0.0
     score += entry.get("views", 0) * 0.08
@@ -1630,17 +1819,38 @@ def compute_recommendation_score(
             score += 120.0 * (seq_weight / max_sequence_weight)
         else:
             score += seq_weight * 12.0
+    walk_weight = float(entry.get("_walk_weight") or 0.0)
+    if walk_weight > 0.0:
+        if max_walk_weight > 0.0:
+            score += 110.0 * (walk_weight / max_walk_weight)
+        else:
+            score += walk_weight * 10.0
+    collab_watch = float(entry.get("_collab_watch") or 0.0)
+    if collab_watch > 0.0:
+        if max_collab_watch > 0.0:
+            score += 160.0 * (collab_watch / max_collab_watch)
+        else:
+            score += collab_watch * 12.0
+    elif collab_watch < 0.0 and max_collab_watch:
+        score += 80.0 * (collab_watch / max_collab_watch)
+    collab_react = float(entry.get("_collab_react") or 0.0)
+    if max_collab_react > 0.0:
+        score += 90.0 * (collab_react / max_collab_react)
+    elif max_collab_react < 0.0:
+        score += 90.0 * (collab_react / abs(max_collab_react))
+    else:
+        score += collab_react * 6.0
     author = entry.get("author")
     same_directory = bool(current_dir_prefix and entry["path"].startswith(current_dir_prefix))
     if current_author and author == current_author:
-        score += 18.0 if (seq_weight > 0.0 or not same_directory) else 8.0
+        score += 14.0 if (seq_weight > 0.0 or collab_watch > 0.0 or collab_react > 0.0) else 6.0
     if same_directory:
-        if seq_weight > 0.0:
-            score += 6.0
+        if seq_weight > 0.0 or walk_weight > 0.0 or collab_watch > 0.0 or collab_react > 0.0:
+            score += 5.0
         else:
-            score -= 18.0
+            score -= 22.0
     else:
-        score += 4.0
+        score += 6.0
     weights = author_weights or {}
     if author and author in weights:
         score += weights[author] * 7.0
@@ -1652,7 +1862,14 @@ def compute_recommendation_score(
     if mtime:
         age_days = max((reference - mtime) / 86400.0, 0.0)
         score += max(0.0, 25.0 - age_days)
-    score += random.random()
+    if duration_pref and duration_pref > 0.0:
+        duration_seconds = float(entry.get("duration_seconds") or 0.0)
+        if duration_seconds > 0.0:
+            diff_minutes = abs(duration_seconds - duration_pref) / 60.0
+            score -= min(diff_minutes * 1.4, 22.0)
+        else:
+            score -= 3.0
+    score += random.random() * 0.35
     return score
 
 
@@ -1662,12 +1879,25 @@ def recommend_videos(current_path: str, videos: List[Dict], current_author: Opti
     watched_paths = user_watched_paths()
     reference_ts = time.time()
     max_sequence_weight = 0.0
+    max_collab_watch = 0.0
+    max_collab_react = 0.0
+    max_walk_weight = 0.0
+    duration_pref = user_duration_preference()
     for entry in videos:
         if entry["path"] == current_path:
             continue
         seq_weight = float(entry.get("_sequence_weight") or 0.0)
         if seq_weight > max_sequence_weight:
             max_sequence_weight = seq_weight
+        watch_signal = float(entry.get("_collab_watch") or 0.0)
+        if watch_signal > max_collab_watch:
+            max_collab_watch = watch_signal
+        reaction_signal = abs(float(entry.get("_collab_react") or 0.0))
+        if reaction_signal > max_collab_react:
+            max_collab_react = reaction_signal
+        walk_signal = float(entry.get("_walk_weight") or 0.0)
+        if walk_signal > max_walk_weight:
+            max_walk_weight = walk_signal
     for entry in videos:
         if entry["path"] == current_path:
             continue
@@ -1681,6 +1911,10 @@ def recommend_videos(current_path: str, videos: List[Dict], current_author: Opti
                 watched_paths,
                 reference_ts,
                 max_sequence_weight,
+                max_collab_watch,
+                max_collab_react,
+                max_walk_weight,
+                duration_pref,
             ),
             entry_copy,
         ))
@@ -1879,6 +2113,28 @@ def user_author_weights() -> Dict[str, float]:
         weights[author] = weights.get(author, 0.0) + 3.0
     g._author_weights = weights
     return weights
+
+
+def user_duration_preference() -> Optional[float]:
+    user = getattr(g, "user", None)
+    if user is None:
+        return None
+    cached = getattr(g, "_duration_pref", None)
+    if cached is not None:
+        return cached
+    db = get_db()
+    row = db.execute(
+        "SELECT seconds_watched, views_count FROM user_stats WHERE user_id = ?",
+        (user["id"],),
+    ).fetchone()
+    if row and row["views_count"]:
+        seconds = max(float(row["seconds_watched"] or 0.0), 0.0)
+        views = max(float(row["views_count"] or 0.0), 1.0)
+        avg = seconds / views
+        g._duration_pref = avg
+        return avg
+    g._duration_pref = None
+    return None
 
 
 def user_reaction_for(path: str) -> Optional[str]:
@@ -3657,6 +3913,7 @@ def api_like():
         )
     db.commit()
     refresh_reaction_cache_for([path])
+    invalidate_collaborative_cache_for([path])
     counts = reaction_counts([path])[path]
     return jsonify({"ok": True, "likes": counts["likes"], "dislikes": counts["dislikes"], "user_reaction": user_reaction_for(path)})
 
@@ -3686,6 +3943,7 @@ def api_dislike():
         )
     db.commit()
     refresh_reaction_cache_for([path])
+    invalidate_collaborative_cache_for([path])
     counts = reaction_counts([path])[path]
     return jsonify({"ok": True, "likes": counts["likes"], "dislikes": counts["dislikes"], "user_reaction": user_reaction_for(path)})
 
@@ -4432,6 +4690,7 @@ def admin_delete(filepath):
             remove_author_overrides([filepath], db=db, autocommit=False)
             db.commit()
             invalidate_transition_cache_for([filepath])
+            invalidate_collaborative_cache_for([filepath])
         except Exception as e:
             print("Ошибка удаления:", e)
     return redirect(url_for("browse", subpath=os.path.dirname(filepath)))
