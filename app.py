@@ -29,6 +29,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.http import parse_range_header, http_date
 from werkzeug.wsgi import wrap_file
 
+from recommender import VideoRecommender
+
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("APP_SECRET_KEY", "change-me")
 
@@ -54,6 +56,19 @@ SEARCH_RESULT_LIMIT = 250
 os.makedirs(PREVIEW_ROOT, exist_ok=True)
 os.makedirs(UPLOAD_ROOT, exist_ok=True)
 os.makedirs(VIDEO_ROOT, exist_ok=True)
+
+# Directory used to store recommendation artefacts (FAISS index, metadata).
+RECOMMENDER_DATA_DIR = os.environ.get("RECOMMENDER_DATA_DIR", os.path.join(VIDEO_ROOT, "__recommender__"))
+os.makedirs(RECOMMENDER_DATA_DIR, exist_ok=True)
+
+# Lazily initialised recommender instance shared across requests.
+video_recommender = VideoRecommender(
+    db_path=DATABASE_PATH,
+    video_root=VIDEO_ROOT,
+    index_path=os.path.join(RECOMMENDER_DATA_DIR, "video.faiss"),
+    metadata_cache=os.path.join(RECOMMENDER_DATA_DIR, "videos.json"),
+)
+video_recommender.warm_start()
 
 FFMPEG_CHECK_TIMEOUT = int(os.environ.get("FFMPEG_CHECK_TIMEOUT", "180"))
 FFMPEG_FIX_COPY_TIMEOUT = int(os.environ.get("FFMPEG_FIX_COPY_TIMEOUT", "900"))
@@ -4782,6 +4797,24 @@ def require_auth_api():
         return jsonify({"ok": False, "error": "auth_required"}), 401
     return None
 
+
+@app.route("/api/recommendations/<int:user_id>")
+def api_recommendations(user_id: int):
+    """Return a list of recommended videos for the given user.
+
+    The route is intentionally lightweight: the heavy lifting (embedding,
+    indexing, ranking) is delegated to ``recommender.VideoRecommender`` so
+    the rest of the Flask app remains agnostic to the recommendation
+    pipeline.  ``limit`` can be tweaked by clients via a query parameter.
+    """
+    limit = request.args.get("limit", default=10, type=int) or 10
+    limit = max(1, min(limit, 30))
+    recommendations = video_recommender.recommend_for_user(user_id, limit=limit)
+    return jsonify({
+        "user_id": user_id,
+        "count": len(recommendations),
+        "items": recommendations,
+    })
 
 @app.route("/api/search")
 def api_search():
