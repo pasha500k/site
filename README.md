@@ -15,3 +15,12 @@
 - `chunk_and_embed.py` — разбиение найденного текста и мультиязычные эмбеддинги MiniLM.
 - `build_graph.py` — простое построение триплетов (сущность–отношение–сущность) и накопление графа.
 - `rag_answer.py` — slow pipeline: план поиска → 2–3 захода → summary → links → финальный ответ.
+- `web_chat.py` + `static/` — небольшой веб-чат как у ChatGPT с панелью мыслей (SourcesSummary, ConceptLinks, DatasetLog), работает поверх slow-thinking RAG и, при наличии локальной LLM, полирует ответ.
+
+## Быстрый старт: веб-чат с "мыслями"
+
+1. Установите зависимости (при необходимости): `pip install flask transformers peft sentence-transformers torch` (версии выбирайте под свою CUDA/CPU).
+2. Запустите сервер: `python web_chat.py --host 0.0.0.0 --port 7860 --device cpu` (параметры модели опциональны; без них ответы возьмутся из RAG-шаблона).
+3. Откройте в браузере `http://localhost:7860` — слева чат, справа панель мыслей. Ответы всегда идут по схеме SourcesSummary → ConceptLinks → FinalAnswer.
+
+Опционально укажите `--model_dir`, `--tokenizer`, `--adapter`, чтобы подмешать свой чекпоинт и получать более гладкий FinalAnswer.
