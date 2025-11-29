@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GameDev Text LLM — Web Chat</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <h1>GameDev Text LLM</h1>
+      <p>Медленный, но точный чат с источниками и связями, как у ChatGPT.</p>
+    </div>
+    <div class="status" id="status">offline</div>
+  </header>
+
+  <main class="layout">
+    <section class="chat-panel">
+      <div id="messages" class="messages"></div>
+      <form id="chat-form" class="chat-form">
+        <textarea id="message-input" placeholder="Опиши задачу по игре или задай вопрос..." rows="2"></textarea>
+        <div class="controls">
+          <input id="stage" type="text" placeholder="stage (prototype)" />
+          <input id="engine" type="text" placeholder="engine (ue5)" />
+          <input id="genre" type="text" placeholder="genre (comma)" />
+          <input id="constraints" type="text" placeholder="constraints" />
+          <select id="mode">
+            <option value="Designer">Designer</option>
+            <option value="Coder">Coder</option>
+          </select>
+          <button type="submit">Отправить</button>
+        </div>
+      </form>
+    </section>
+
+    <aside class="thoughts-panel">
+      <h2>Мысли (slow-thinking)</h2>
+      <div class="thought-block">
+        <h3>SourcesSummary</h3>
+        <pre id="sources-summary">—</pre>
+      </div>
+      <div class="thought-block">
+        <h3>ConceptLinks</h3>
+        <ul id="concept-links"></ul>
+      </div>
+      <div class="thought-block">
+        <h3>DatasetLog</h3>
+        <pre id="dataset-log">—</pre>
+      </div>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
