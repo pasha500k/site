@@ -174,6 +174,7 @@ def index():
                         <select id="camera-select" style="width:100%; padding:10px; border-radius:10px; border:1px solid #d1d5db; background:#f9fafb;"></select>
                     </div>
                     <div id="status">Ожидаем сканирования...</div>
+                    <button id="start-camera" class="btn primary" style="margin-top:12px;width:100%;display:none;">Включить камеру</button>
                 </div>
             </div>
 
@@ -223,6 +224,7 @@ def index():
                 const cameraSelect = document.getElementById('camera-select');
                 const cameraWrap = document.getElementById('camera-wrap');
                 let startingScanner = false;
+                let cameraReady = false;
 
                 function initMap() {
                     map = L.map('map').setView([55.751244, 37.618423], 12);
@@ -252,7 +254,9 @@ def index():
                 async function startScanner(cameraId = null) {
                     if (startingScanner) return;
                     startingScanner = true;
+                    cameraReady = false;
                     statusEl.innerText = 'Запрашиваем камеру...';
+                    document.getElementById('start-camera').style.display = 'none';
                     try {
                         const cameras = await Html5Qrcode.getCameras();
                         if (!cameras || cameras.length === 0) {
@@ -271,7 +275,9 @@ def index():
                         if (cameraId) {
                             cameraSelect.value = cameraId;
                         }
-                        const selectedId = cameraSelect.value || cameras[0].id;
+                        // Prefer back camera when available
+                        const preferred = cameras.find(c => /back|rear|environment/i.test(c.label || ''));
+                        const selectedId = cameraSelect.value || preferred?.id || cameras[0].id;
                         const config = { fps: 10, qrbox: { width: 240, height: 240 } };
                         if (html5Scanner) {
                             try { await html5Scanner.stop(); } catch (e) {}
@@ -279,8 +285,10 @@ def index():
                         html5Scanner = new Html5Qrcode("reader");
                         await html5Scanner.start(selectedId, config, onScanSuccess);
                         statusEl.innerText = 'Наведите камеру на QR-код';
+                        cameraReady = true;
                     } catch (err) {
-                        statusEl.innerText = 'Не удалось запустить камеру';
+                        statusEl.innerText = 'Разрешите доступ к камере и попробуйте снова';
+                        document.getElementById('start-camera').style.display = 'block';
                     } finally {
                         startingScanner = false;
                     }
@@ -421,6 +429,10 @@ def index():
                 document.getElementById('cancel-add').addEventListener('click', () => closeAddForm());
 
                 cameraSelect.addEventListener('change', () => {
+                    startScanner(cameraSelect.value);
+                });
+
+                document.getElementById('start-camera').addEventListener('click', () => {
                     startScanner(cameraSelect.value);
                 });
 
