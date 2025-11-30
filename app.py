@@ -3,6 +3,7 @@ import time
 import threading
 from typing import Dict, List
 
+import requests
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO, emit, join_room
 
@@ -13,6 +14,8 @@ socketio = SocketIO(app, async_mode='threading')
 ACCESS_CODE = "ACCESS123"
 SESSION_LIFETIME = 2 * 60 * 60  # 2 hours in seconds
 DANGER_LIFETIME = 7 * 60  # 7 minutes in seconds
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8229885598:AAE3m3Chvaob6aqCacz35CMIoyfN5arOX7c")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8258050467")
 
 sessions: Dict[str, float] = {}
 user_locations: Dict[str, Dict[str, float]] = {}
@@ -21,6 +24,25 @@ danger_points: List[Dict] = []
 session_lock = threading.Lock()
 danger_lock = threading.Lock()
 location_lock = threading.Lock()
+
+
+def send_telegram_message(text: str):
+    """Send notification to admin via Telegram bot."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            timeout=5,
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+        )
+    except Exception:
+        # Silently ignore Telegram issues to avoid breaking the app
+        pass
+
+
+def notify_admin_async(message: str):
+    threading.Thread(target=send_telegram_message, args=(message,), daemon=True).start()
 
 
 def session_valid(user_id: str) -> bool:
@@ -168,6 +190,8 @@ def index():
                 </select>
                 <label for="danger-desc">Комментарий</label>
                 <textarea id="danger-desc" placeholder="Краткое описание"></textarea>
+                <label for="danger-photo">Фото (необязательно)</label>
+                <input type="file" id="danger-photo" accept="image/*" style="width:100%; padding:6px 0;" />
                 <div class="actions">
                     <button class="btn secondary" id="cancel-add">Отмена</button>
                     <button class="btn primary" id="submit-add">Добавить</button>
@@ -214,6 +238,8 @@ def index():
                 function closeAddForm() {
                     addForm.style.display = 'none';
                     addLatLng = null;
+                    document.getElementById('danger-desc').value = '';
+                    document.getElementById('danger-photo').value = '';
                 }
 
                 function startScanner() {
@@ -291,7 +317,8 @@ def index():
                             fillColor: color,
                             fillOpacity: 0.35
                         }).addTo(map);
-                        marker.bindPopup(`<strong>${labelForType(p.type)}</strong><br>${p.desc || 'Без комментария'}`);
+                        const imgHtml = p.image ? `<div style="margin-top:8px;"><img src="${p.image}" alt="Фото" style="max-width:180px;border-radius:10px;box-shadow:0 6px 16px rgba(0,0,0,0.12);" /></div>` : '';
+                        marker.bindPopup(`<strong>${labelForType(p.type)}</strong><br>${p.desc || 'Без комментария'}${imgHtml}`);
                         return marker;
                     });
                 }
@@ -319,11 +346,37 @@ def index():
                     });
                 }
 
-                document.getElementById('submit-add').addEventListener('click', () => {
+                const toBase64 = (file) => {
+                    return new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onload = () => resolve(reader.result);
+                        reader.onerror = (error) => reject(error);
+                        reader.readAsDataURL(file);
+                    });
+                };
+
+                document.getElementById('submit-add').addEventListener('click', async () => {
                     if (!addLatLng || !sessionActive) return;
                     const type = document.getElementById('danger-type').value;
                     const desc = document.getElementById('danger-desc').value.trim();
-                    socket.emit('add_danger', { user_id: userId, lat: addLatLng.lat, lng: addLatLng.lng, type, desc });
+                    const fileInput = document.getElementById('danger-photo');
+                    const file = fileInput.files[0];
+                    let image = null;
+                    if (file) {
+                        if (file.size > 2 * 1024 * 1024) {
+                            alert('Размер файла не должен превышать 2 МБ');
+                            return;
+                        }
+                        try {
+                            image = await toBase64(file);
+                        } catch (e) {
+                            alert('Не удалось прочитать файл');
+                            return;
+                        }
+                    }
+                    socket.emit('add_danger', { user_id: userId, lat: addLatLng.lat, lng: addLatLng.lng, type, desc, image });
+                    fileInput.value = '';
+                    document.getElementById('danger-desc').value = '';
                     closeAddForm();
                 });
 
@@ -397,6 +450,7 @@ def handle_login(data):
         return
     mark_session(user_id)
     join_room(user_id)
+    notify_admin_async(f"Пользователь {user_id} вошел с кодом {ACCESS_CODE}")
     emit('login_result', {'success': True})
     with danger_lock:
         points_copy = list(danger_points)
@@ -440,6 +494,7 @@ def handle_add_danger(data):
     lng = (data or {}).get('lng')
     dtype = (data or {}).get('type')
     desc = (data or {}).get('desc', '')
+    image = (data or {}).get('image')
     try:
         lat = float(lat)
         lng = float(lng)
@@ -447,7 +502,13 @@ def handle_add_danger(data):
         return
     if dtype not in {'infected', 'mask', 'other'}:
         dtype = 'other'
-    point = {'lat': lat, 'lng': lng, 'type': dtype, 'desc': desc, 'timestamp': time.time()}
+    if image and isinstance(image, str):
+        # Basic size guard (~3MB of base64 text)
+        if len(image) > 4_000_000:
+            image = None
+    else:
+        image = None
+    point = {'lat': lat, 'lng': lng, 'type': dtype, 'desc': desc, 'timestamp': time.time(), 'image': image}
     with danger_lock:
         danger_points.append(point)
         points_copy = list(danger_points)
