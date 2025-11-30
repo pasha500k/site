@@ -167,8 +167,12 @@ def index():
             <div id="overlay">
                 <div id="login-card">
                     <h1>QR-доступ</h1>
-                    <p>Отсканируйте ваш QR-код для входа. Допустимый код: <strong>ACCESS123</strong></p>
+                    <p>Отсканируйте ваш QR-код для входа. Код получает администратор.</p>
                     <div id="reader"></div>
+                    <div id="camera-wrap" class="hidden" style="margin:10px 0 0;">
+                        <label for="camera-select" style="display:block; font-weight:600; margin-bottom:6px; text-align:left;">Камера</label>
+                        <select id="camera-select" style="width:100%; padding:10px; border-radius:10px; border:1px solid #d1d5db; background:#f9fafb;"></select>
+                    </div>
                     <div id="status">Ожидаем сканирования...</div>
                 </div>
             </div>
@@ -216,6 +220,9 @@ def index():
                 const overlay = document.getElementById('overlay');
                 const sessionBadge = document.getElementById('session-state');
                 let html5Scanner = null;
+                const cameraSelect = document.getElementById('camera-select');
+                const cameraWrap = document.getElementById('camera-wrap');
+                let startingScanner = false;
 
                 function initMap() {
                     map = L.map('map').setView([55.751244, 37.618423], 12);
@@ -242,10 +249,41 @@ def index():
                     document.getElementById('danger-photo').value = '';
                 }
 
-                function startScanner() {
-                    const config = { fps: 10, qrbox: { width: 240, height: 240 } };
-                    html5Scanner = new Html5Qrcode("reader");
-                    html5Scanner.start({ facingMode: "environment" }, config, onScanSuccess);
+                async function startScanner(cameraId = null) {
+                    if (startingScanner) return;
+                    startingScanner = true;
+                    statusEl.innerText = 'Запрашиваем камеру...';
+                    try {
+                        const cameras = await Html5Qrcode.getCameras();
+                        if (!cameras || cameras.length === 0) {
+                            statusEl.innerText = 'Камера не найдена';
+                            startingScanner = false;
+                            return;
+                        }
+                        cameraWrap.classList.remove('hidden');
+                        cameraSelect.innerHTML = '';
+                        cameras.forEach((cam, idx) => {
+                            const opt = document.createElement('option');
+                            opt.value = cam.id;
+                            opt.textContent = cam.label || `Камера ${idx + 1}`;
+                            cameraSelect.appendChild(opt);
+                        });
+                        if (cameraId) {
+                            cameraSelect.value = cameraId;
+                        }
+                        const selectedId = cameraSelect.value || cameras[0].id;
+                        const config = { fps: 10, qrbox: { width: 240, height: 240 } };
+                        if (html5Scanner) {
+                            try { await html5Scanner.stop(); } catch (e) {}
+                        }
+                        html5Scanner = new Html5Qrcode("reader");
+                        await html5Scanner.start(selectedId, config, onScanSuccess);
+                        statusEl.innerText = 'Наведите камеру на QR-код';
+                    } catch (err) {
+                        statusEl.innerText = 'Не удалось запустить камеру';
+                    } finally {
+                        startingScanner = false;
+                    }
                 }
 
                 function onScanSuccess(decodedText) {
@@ -274,9 +312,9 @@ def index():
                         resetMapState();
                         statusEl.innerText = 'Ожидаем сканирования...';
                         if (html5Scanner) {
-                            html5Scanner.stop().catch(() => {}).finally(() => startScanner());
+                            html5Scanner.stop().catch(() => {}).finally(() => startScanner(cameraSelect.value));
                         } else {
-                            startScanner();
+                            startScanner(cameraSelect.value);
                         }
                     }
                 }
@@ -381,6 +419,10 @@ def index():
                 });
 
                 document.getElementById('cancel-add').addEventListener('click', () => closeAddForm());
+
+                cameraSelect.addEventListener('change', () => {
+                    startScanner(cameraSelect.value);
+                });
 
                 socket.on('connect', () => {
                     // Register presence for session rooms
