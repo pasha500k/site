@@ -258,6 +258,14 @@ def index():
                     statusEl.innerText = 'Запрашиваем камеру...';
                     document.getElementById('start-camera').style.display = 'none';
                     try {
+                        if (!navigator.mediaDevices?.getUserMedia) {
+                            throw new Error('camera_api_missing');
+                        }
+
+                        // Явно запрашиваем разрешение перед перечислением камер
+                        const preflight = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+                        preflight.getTracks().forEach(t => t.stop());
+
                         const cameras = await Html5Qrcode.getCameras();
                         if (!cameras || cameras.length === 0) {
                             statusEl.innerText = 'Камера не найдена';
@@ -279,15 +287,22 @@ def index():
                         const preferred = cameras.find(c => /back|rear|environment/i.test(c.label || ''));
                         const selectedId = cameraSelect.value || preferred?.id || cameras[0].id;
                         const config = { fps: 10, qrbox: { width: 240, height: 240 } };
+                        const source = selectedId ? selectedId : { facingMode: 'environment' };
                         if (html5Scanner) {
                             try { await html5Scanner.stop(); } catch (e) {}
                         }
                         html5Scanner = new Html5Qrcode("reader");
-                        await html5Scanner.start(selectedId, config, onScanSuccess);
+                        await html5Scanner.start(source, config, onScanSuccess);
                         statusEl.innerText = 'Наведите камеру на QR-код';
                         cameraReady = true;
                     } catch (err) {
-                        statusEl.innerText = 'Разрешите доступ к камере и попробуйте снова';
+                        if (err?.name === 'NotAllowedError' || err?.message === 'Permission denied') {
+                            statusEl.innerText = 'Доступ к камере отклонён. Разрешите камеру и нажмите «Включить камеру» снова.';
+                        } else if (err?.name === 'NotFoundError') {
+                            statusEl.innerText = 'Не удалось обнаружить камеру. Проверьте подключение устройства.';
+                        } else {
+                            statusEl.innerText = 'Разрешите доступ к камере и попробуйте снова';
+                        }
                         document.getElementById('start-camera').style.display = 'block';
                     } finally {
                         startingScanner = false;
