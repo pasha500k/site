@@ -173,8 +173,8 @@ def index():
                         <label for="camera-select" style="display:block; font-weight:600; margin-bottom:6px; text-align:left;">Камера</label>
                         <select id="camera-select" style="width:100%; padding:10px; border-radius:10px; border:1px solid #d1d5db; background:#f9fafb;"></select>
                     </div>
-                    <div id="status">Ожидаем сканирования...</div>
-                    <button id="start-camera" class="btn primary" style="margin-top:12px;width:100%;display:none;">Включить камеру</button>
+                    <div id="status">Нажмите «Включить камеру», чтобы начать сканирование.</div>
+                    <button id="start-camera" class="btn primary" style="margin-top:12px;width:100%;">Включить камеру</button>
                 </div>
             </div>
 
@@ -291,6 +291,7 @@ def index():
                         document.getElementById('start-camera').style.display = 'block';
                     } finally {
                         startingScanner = false;
+                        document.getElementById('start-camera').style.display = 'block';
                     }
                 }
 
@@ -318,11 +319,9 @@ def index():
                         sessionBadge.classList.remove('green');
                         stopGeoLoop();
                         resetMapState();
-                        statusEl.innerText = 'Ожидаем сканирования...';
+                        statusEl.innerText = 'Нажмите «Включить камеру», чтобы начать сканирование.';
                         if (html5Scanner) {
-                            html5Scanner.stop().catch(() => {}).finally(() => startScanner(cameraSelect.value));
-                        } else {
-                            startScanner(cameraSelect.value);
+                            html5Scanner.stop().catch(() => {});
                         }
                     }
                 }
@@ -429,7 +428,9 @@ def index():
                 document.getElementById('cancel-add').addEventListener('click', () => closeAddForm());
 
                 cameraSelect.addEventListener('change', () => {
-                    startScanner(cameraSelect.value);
+                    if (cameraReady || html5Scanner) {
+                        startScanner(cameraSelect.value);
+                    }
                 });
 
                 document.getElementById('start-camera').addEventListener('click', () => {
@@ -472,7 +473,6 @@ def index():
 
                 function init() {
                     initMap();
-                    startScanner();
                 }
 
                 init();
