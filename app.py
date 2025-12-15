@@ -349,14 +349,6 @@ def security_headers(request: Request, response: Response) -> None:
 
 
 app = FastAPI()
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=SESSION_SECRET,
-    session_cookie="vault_session",
-    https_only=SESSION_COOKIE_SECURE,
-    same_site="lax",
-    max_age=60 * 60 * 8,
-)
 
 
 @app.middleware("http")
@@ -373,6 +365,16 @@ async def auth_middleware(request: Request, call_next):
     response = await call_next(request)
     security_headers(request, response)
     return response
+
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    session_cookie="vault_session",
+    https_only=SESSION_COOKIE_SECURE,
+    same_site="lax",
+    max_age=60 * 60 * 8,
+)
 
 
 @app.get("/")
