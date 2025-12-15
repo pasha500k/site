@@ -331,6 +331,16 @@ def decrypt_value(item_id: int, field: str, nonce_b64: Optional[str], ct_b64: Op
         return "[decryption error]"
 
 
+def commit_session(db: DBSession, request: Request, success_message: Optional[str] = None) -> None:
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Database error")
+    if success_message:
+        add_flash(request, success_message)
+
+
 def security_headers(request: Request, response: Response) -> None:
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -443,20 +453,23 @@ async def create_item(
     secret: str = Form("") ,
     notes: str = Form(""),
 ):
-    item = VaultItem(title=title, category=category, url=url or None, login=login_field or None, tags=tags or None)
-    db.add(item)
-    db.flush()
-    item_id = item.id
-    if secret:
-        nonce, ct = encrypt_value(item_id, "secret", secret)
-        item.secret_nonce = nonce
-        item.secret_ciphertext = ct
-    if notes:
-        nonce_n, ct_n = encrypt_value(item_id, "notes", notes)
-        item.notes_nonce = nonce_n
-        item.notes_ciphertext = ct_n
-    db.commit()
-    add_flash(request, "Item created")
+    try:
+        item = VaultItem(title=title, category=category, url=url or None, login=login_field or None, tags=tags or None)
+        db.add(item)
+        db.flush()
+        item_id = item.id
+        if secret:
+            nonce, ct = encrypt_value(item_id, "secret", secret)
+            item.secret_nonce = nonce
+            item.secret_ciphertext = ct
+        if notes:
+            nonce_n, ct_n = encrypt_value(item_id, "notes", notes)
+            item.notes_nonce = nonce_n
+            item.notes_ciphertext = ct_n
+        commit_session(db, request, "Item created")
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Database error")
     return RedirectResponse(f"/items/{item.id}", status_code=HTTP_303_SEE_OTHER)
 
 
@@ -493,35 +506,47 @@ async def update_item(
     secret: str = Form("") ,
     notes: str = Form(""),
 ):
-    item = db.get(VaultItem, item_id)
-    if not item:
-        raise HTTPException(status_code=404)
-    item.title = title
-    item.category = category
-    item.url = url or None
-    item.login = login_field or None
-    item.tags = tags or None
-    if secret:
-        nonce, ct = encrypt_value(item.id, "secret", secret)
-        item.secret_nonce = nonce
-        item.secret_ciphertext = ct
-    if notes or item.notes_ciphertext:
-        nonce_n, ct_n = encrypt_value(item.id, "notes", notes)
-        item.notes_nonce = nonce_n
-        item.notes_ciphertext = ct_n
-    db.commit()
-    add_flash(request, "Item updated")
+    try:
+        item = db.get(VaultItem, item_id)
+        if not item:
+            raise HTTPException(status_code=404)
+        item.title = title
+        item.category = category
+        item.url = url or None
+        item.login = login_field or None
+        item.tags = tags or None
+        if secret:
+            nonce, ct = encrypt_value(item.id, "secret", secret)
+            item.secret_nonce = nonce
+            item.secret_ciphertext = ct
+        if notes or item.notes_ciphertext:
+            nonce_n, ct_n = encrypt_value(item.id, "notes", notes)
+            item.notes_nonce = nonce_n
+            item.notes_ciphertext = ct_n
+        commit_session(db, request, "Item updated")
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Database error")
     return RedirectResponse(f"/items/{item.id}", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/items/{item_id}/delete")
 async def delete_item(request: Request, item_id: int, db: DBSession = Depends(get_db)):
-    item = db.get(VaultItem, item_id)
-    if not item:
-        raise HTTPException(status_code=404)
-    db.delete(item)
-    db.commit()
-    add_flash(request, "Item deleted")
+    try:
+        item = db.get(VaultItem, item_id)
+        if not item:
+            raise HTTPException(status_code=404)
+        db.delete(item)
+        commit_session(db, request, "Item deleted")
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Database error")
     return RedirectResponse("/items", status_code=HTTP_303_SEE_OTHER)
 
 
