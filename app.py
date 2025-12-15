@@ -1,4 +1,4 @@
-# pip install fastapi uvicorn sqlalchemy jinja2 passlib[bcrypt] cryptography python-multipart
+# pip install fastapi uvicorn sqlalchemy jinja2 passlib[argon2] cryptography python-multipart
 import base64
 import os
 import secrets
@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.middleware import Middleware
 from starlette.middleware.sessions import SessionMiddleware
 from jinja2 import Environment, DictLoader, select_autoescape
-from passlib.hash import bcrypt
+from passlib.hash import argon2
 from sqlalchemy import Column, DateTime, Integer, String, create_engine, select
 from sqlalchemy.orm import declarative_base, sessionmaker, Session as DBSession
 from starlette.datastructures import URL
@@ -24,7 +24,7 @@ password = "CHANGE_ME_STRONG"
 SESSION_COOKIE_SECURE = False  # set True in production with HTTPS
 SESSION_SECRET = secrets.token_hex(32)
 LOGIN_RATE_LIMIT = 8  # attempts per minute per IP
-HASHED_PASSWORD = bcrypt.hash(password)
+HASHED_PASSWORD = argon2.hash(password)
 
 # Master key setup
 raw_master = os.getenv("VAULT_MASTER_KEY")
@@ -378,7 +378,7 @@ async def login(request: Request, username: str = Form(...), password_input: str
     client_ip = request.client.host if request.client else "unknown"
     if not rate_limit(client_ip):
         return PlainTextResponse("Too many attempts, slow down", status_code=429)
-    if username != "admin" or not bcrypt.verify(password_input, HASHED_PASSWORD):
+    if username != "admin" or not argon2.verify(password_input, HASHED_PASSWORD):
         add_flash(request, "Invalid credentials")
         return RedirectResponse("/login", status_code=HTTP_303_SEE_OTHER)
     request.session["user"] = "admin"
@@ -537,5 +537,5 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 @app.on_event("startup")
 async def on_startup():
     Base.metadata.create_all(bind=engine)
-    bcrypt.hash(password)
+    argon2.hash(password)
 
