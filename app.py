@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
-from fastapi.middleware import Middleware
 from starlette.middleware.sessions import SessionMiddleware
 from jinja2 import Environment, DictLoader, select_autoescape
 from passlib.hash import argon2
@@ -349,8 +348,15 @@ def security_headers(request: Request, response: Response) -> None:
     response.headers["Content-Security-Policy"] = csp
 
 
-middleware = [Middleware(SessionMiddleware, secret_key=SESSION_SECRET, session_cookie="vault_session", https_only=SESSION_COOKIE_SECURE, same_site="lax", max_age=60 * 60 * 8)]
-app = FastAPI(middleware=middleware)
+app = FastAPI()
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    session_cookie="vault_session",
+    https_only=SESSION_COOKIE_SECURE,
+    same_site="lax",
+    max_age=60 * 60 * 8,
+)
 
 
 @app.middleware("http")
