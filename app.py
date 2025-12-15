@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.middleware import Middleware
-from fastapi.middleware.sessions import SessionMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 from jinja2 import Environment, DictLoader, select_autoescape
 from passlib.hash import bcrypt
 from sqlalchemy import Column, DateTime, Integer, String, create_engine, select
