@@ -32,12 +32,13 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret_safe_key_123'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DEFAULT_TELEGRAM_BOT_TOKEN = "8522303446:AAGwzzKZF-vbCArx-_D5NJCG_A0b1KS-KIo"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or DEFAULT_TELEGRAM_BOT_TOKEN
 
 
 def _parse_admin_ids():
     env_value = os.getenv("TELEGRAM_ADMIN_IDS") or os.getenv("TELEGRAM_ADMIN_ID")
-    admins: list[int] = [8258050467]  # Second admin by default
+    admins: list[int] = [8258050467, 944178740]
     if not env_value:
         return admins
 
