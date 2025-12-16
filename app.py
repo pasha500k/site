@@ -35,7 +35,8 @@ logging.getLogger("engineio").setLevel(logging.ERROR)
 
 # --- Configuration constants (kept inline as requested) ---
 SECRET_KEY = "secret_safe_key_123"
-TELEGRAM_BOT_TOKEN = "8229885598:AAE3m3Chvaob6aqCacz35CMIoyfN5arOX7c"
+# NOTE: token provided by the project owner for production use.
+TELEGRAM_BOT_TOKEN = "8229885598:AAHBHbuV2c5WBjcNjsxiLiIVj8oBs1IBkRg"
 TELEGRAM_ADMIN_ID = 8258050467
 DAILY_SALT = "LetovoCorpSecretSalt"
 SESSION_DURATION = 2 * 60 * 60
@@ -172,6 +173,8 @@ def send_access_info(today: str, code: str) -> None:
     """Submit sending to the bot loop."""
     if bot_loop and bot_loop.is_running():
         asyncio.run_coroutine_threadsafe(send_access_info_async(today, code), bot_loop)
+    else:
+        logging.warning("Bot loop is not running; cannot deliver access code")
 
 
 @dp.message(Command("code"))
@@ -187,15 +190,25 @@ async def cmd_code(message: types.Message) -> None:
 # --- Bot startup ---
 
 def start_bot_process() -> None:
-    """Run aiogram polling in a background thread."""
+    """Run aiogram polling in a background thread with auto-restart."""
     global bot_loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    bot_loop = loop
-    try:
-        loop.run_until_complete(dp.start_polling(bot))
-    except Exception as exc:  # pragma: no cover - defensive
-        logging.error("Bot crashed: %s", exc)
+    while True:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        bot_loop = loop
+        try:
+            loop.run_until_complete(dp.start_polling(bot, handle_signals=False))
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.error("Bot crashed: %s", exc)
+        finally:
+            bot_loop = None
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:  # pragma: no cover - defensive
+                pass
+            loop.close()
+        # Small delay before restart to avoid tight crash loop
+        time.sleep(2)
 
 
 threading.Thread(target=start_bot_process, daemon=True).start()
