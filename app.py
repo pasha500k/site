@@ -33,14 +33,27 @@ app.config['SECRET_KEY'] = 'secret_safe_key_123'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-_admin_id_raw = os.getenv("TELEGRAM_ADMIN_ID")
-try:
-    TELEGRAM_ADMIN_ID = int(_admin_id_raw) if _admin_id_raw else None
-except ValueError:
-    TELEGRAM_ADMIN_ID = None
-    logging.warning("TELEGRAM_ADMIN_ID must be an integer. Telegram bot is disabled.")
 
-BOT_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID)
+
+def _parse_admin_ids():
+    env_value = os.getenv("TELEGRAM_ADMIN_IDS") or os.getenv("TELEGRAM_ADMIN_ID")
+    admins: list[int] = [8258050467]  # Second admin by default
+    if not env_value:
+        return admins
+
+    for raw in env_value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            admins.append(int(raw))
+        except ValueError:
+            logging.warning("Ignore invalid TELEGRAM_ADMIN_ID value: %s", raw)
+    return list(dict.fromkeys(admins))
+
+
+TELEGRAM_ADMIN_IDS = _parse_admin_ids()
+BOT_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_IDS)
 
 bot: Bot | None = None
 dp = Dispatcher()
@@ -226,20 +239,20 @@ def get_daily_code():
     code = str(int(hashlib.md5(raw.encode()).hexdigest(), 16))[-12:]
     return today, code
 
-async def send_tg_async(today, code):
+async def send_tg_async(today, code, target_ids):
     if not BOT_ENABLED or not bot:
         logging.info("Skipping Telegram notification: bot disabled")
         return
     try:
         safe_code = urllib.parse.quote(code)
         msg_text = f"🔐 *SafeMap Access*\n📅 Дата: `{today}`\n🔢 Код: `{code}`"
-        await bot.send_message(TELEGRAM_ADMIN_ID, msg_text, parse_mode=ParseMode.MARKDOWN)
-
         barcode_url = f"https://bwipjs-api.metafloor.com/?bcid=code128&text={safe_code}&scale=3&rotate=N&includetext&background=ffffff"
-        await bot.send_photo(TELEGRAM_ADMIN_ID, photo=URLInputFile(barcode_url), caption="📷 *Штрих-код*", parse_mode=ParseMode.MARKDOWN)
-
         qr_url = f"https://bwipjs-api.metafloor.com/?bcid=qrcode&text={safe_code}&scale=3&rotate=N&background=ffffff"
-        await bot.send_photo(TELEGRAM_ADMIN_ID, photo=URLInputFile(qr_url), caption="🔳 *QR-код*", parse_mode=ParseMode.MARKDOWN)
+
+        for admin_id in target_ids:
+            await bot.send_message(admin_id, msg_text, parse_mode=ParseMode.MARKDOWN)
+            await bot.send_photo(admin_id, photo=URLInputFile(barcode_url), caption="📷 *Штрих-код*", parse_mode=ParseMode.MARKDOWN)
+            await bot.send_photo(admin_id, photo=URLInputFile(qr_url), caption="🔳 *QR-код*", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         print(f"[TELEGRAM ERROR] {e}")
 
@@ -248,13 +261,16 @@ async def cmd_code(msg: types.Message):
     if not BOT_ENABLED or not bot:
         await msg.answer("Бот выключен: не настроены TELEGRAM_BOT_TOKEN / TELEGRAM_ADMIN_ID")
         return
-    if msg.from_user.id == TELEGRAM_ADMIN_ID:
-        await msg.answer("Код отправляется автоматически в 00:00. Ручная отправка отключена.")
+    if msg.from_user.id in TELEGRAM_ADMIN_IDS:
+        await msg.answer("Отправляю актуальный код.")
+        await send_tg_async(current_date_str, current_daily_code, [msg.from_user.id])
+    else:
+        await msg.answer("Недостаточно прав.")
 
 
-def send_tg_sync(t, c):
+def send_tg_sync(t, c, targets):
     if bot_loop:
-        asyncio.run_coroutine_threadsafe(send_tg_async(t, c), bot_loop)
+        asyncio.run_coroutine_threadsafe(send_tg_async(t, c, targets), bot_loop)
 
 
 def update_code():
@@ -263,7 +279,7 @@ def update_code():
     if t != current_date_str:
         current_date_str = t
         current_daily_code = c
-        send_tg_sync(t, c)
+        send_tg_sync(t, c, TELEGRAM_ADMIN_IDS)
 
 
 def init_daily_code():
