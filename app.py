@@ -172,6 +172,8 @@ def send_access_info(today: str, code: str) -> None:
     """Submit sending to the bot loop."""
     if bot_loop and bot_loop.is_running():
         asyncio.run_coroutine_threadsafe(send_access_info_async(today, code), bot_loop)
+    else:
+        logging.warning("Bot loop is not running; cannot deliver access code")
 
 
 @dp.message(Command("code"))
@@ -193,7 +195,7 @@ def start_bot_process() -> None:
     asyncio.set_event_loop(loop)
     bot_loop = loop
     try:
-        loop.run_until_complete(dp.start_polling(bot))
+        loop.run_until_complete(dp.start_polling(bot, handle_signals=False))
     except Exception as exc:  # pragma: no cover - defensive
         logging.error("Bot crashed: %s", exc)
 
