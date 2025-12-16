@@ -75,6 +75,7 @@ access_codes = []
 
 current_daily_code = ""
 current_date_str = ""
+daily_code_initialized = False
 
 # ==========================================
 # 1. БАЗА ДАННЫХ
@@ -248,7 +249,7 @@ async def cmd_code(msg: types.Message):
         await msg.answer("Бот выключен: не настроены TELEGRAM_BOT_TOKEN / TELEGRAM_ADMIN_ID")
         return
     if msg.from_user.id == TELEGRAM_ADMIN_ID:
-        await send_tg_async(current_date_str, current_daily_code)
+        await msg.answer("Код отправляется автоматически в 00:00. Ручная отправка отключена.")
 
 
 def send_tg_sync(t, c):
@@ -263,6 +264,18 @@ def update_code():
         current_date_str = t
         current_daily_code = c
         send_tg_sync(t, c)
+
+
+def init_daily_code():
+    """Set today's code without sending a message so startup is silent."""
+    global current_daily_code, current_date_str, daily_code_initialized
+    if daily_code_initialized:
+        return
+    current_date_str, current_daily_code = get_daily_code()
+    daily_code_initialized = True
+
+
+init_daily_code()
 
 
 def bot_thread_func():
