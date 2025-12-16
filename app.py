@@ -274,7 +274,7 @@ def bot_thread_func():
     asyncio.set_event_loop(loop)
     bot_loop = loop
     try:
-        loop.run_until_complete(dp.start_polling(bot))
+        loop.run_until_complete(dp.start_polling(bot, handle_signals=False))
     except Exception as exc:
         logging.error("Telegram bot polling failed: %s", exc)
 
