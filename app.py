@@ -262,8 +262,8 @@ async def cmd_code(msg: types.Message):
         await msg.answer("Бот выключен: не настроены TELEGRAM_BOT_TOKEN / TELEGRAM_ADMIN_ID")
         return
     if msg.from_user.id in TELEGRAM_ADMIN_IDS:
-        await msg.answer("Отправляю актуальный код.")
-        await send_tg_async(current_date_str, current_daily_code, [msg.from_user.id])
+        await msg.answer("Отправляю актуальный код всем администраторам.")
+        await send_tg_async(current_date_str, current_daily_code, TELEGRAM_ADMIN_IDS)
     else:
         await msg.answer("Недостаточно прав.")
 
