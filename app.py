@@ -86,7 +86,6 @@ categories_config = {
     'building': []
 }
 access_codes = []
-floor_plans = []
 
 current_daily_code = ""
 current_date_str = ""
@@ -103,9 +102,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS dangers
                  (id TEXT PRIMARY KEY, lat REAL, lng REAL, type TEXT, desc TEXT, ts REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS buildings
-                 (id TEXT PRIMARY KEY, lat REAL, lng REAL, name TEXT, type TEXT, desc TEXT, coords TEXT, floors INTEGER)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS floor_plans
-                 (id TEXT PRIMARY KEY, building_id TEXT, floor INTEGER, name TEXT, desc TEXT, coords TEXT)''')
+                 (id TEXT PRIMARY KEY, lat REAL, lng REAL, name TEXT, type TEXT, desc TEXT, coords TEXT)''')
 
     # Настройки категорий
     c.execute('''CREATE TABLE IF NOT EXISTS categories
@@ -120,26 +117,6 @@ def init_db():
 
     # Загружаем дефолтные категории, если пусто
     check_defaults()
-
-
-def ensure_buildings_have_floors_column():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("PRAGMA table_info(buildings)")
-    cols = [row[1] for row in c.fetchall()]
-    if 'floors' not in cols:
-        c.execute("ALTER TABLE buildings ADD COLUMN floors INTEGER")
-        conn.commit()
-    conn.close()
-
-
-def ensure_floor_plans_table():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS floor_plans
-                 (id TEXT PRIMARY KEY, building_id TEXT, floor INTEGER, name TEXT, desc TEXT, coords TEXT)''')
-    conn.commit()
-    conn.close()
 
 def check_defaults():
     conn = sqlite3.connect(DB_FILE)
@@ -161,7 +138,7 @@ def check_defaults():
     conn.close()
 
 def load_data_from_db():
-    global dangers, buildings, categories_config, access_codes, floor_plans
+    global dangers, buildings, categories_config, access_codes
     try:
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -196,19 +173,6 @@ def load_data_from_db():
         # Обновляем глобальный список
         access_codes = custom_codes
 
-        # Планировки этажей
-        c.execute("SELECT * FROM floor_plans")
-        raw_plans = c.fetchall()
-        floor_plans = []
-        for row in raw_plans:
-            p = dict(row)
-            if p.get('coords'):
-                try:
-                    p['coords'] = json.loads(p['coords'])
-                except Exception:
-                    p['coords'] = []
-            floor_plans.append(p)
-
         conn.close()
     except Exception as e:
         print(f"[DB ERROR] Load failed: {e}")
@@ -231,25 +195,12 @@ def add_danger_to_db(obj):
 
 def add_building_to_db(obj):
     coords_json = json.dumps(obj.get('coords', []))
-    db_exec("INSERT INTO buildings (id, lat, lng, name, type, desc, coords, floors) VALUES (?,?,?,?,?,?,?,?)",
-            (obj['id'], obj['lat'], obj['lng'], obj['name'], obj['type'], obj['desc'], coords_json, obj.get('floors')))
+    db_exec("INSERT INTO buildings (id, lat, lng, name, type, desc, coords) VALUES (?,?,?,?,?,?,?)",
+            (obj['id'], obj['lat'], obj['lng'], obj['name'], obj['type'], obj['desc'], coords_json))
 
-
-def add_plan_to_db(obj):
-    coords_json = json.dumps(obj.get('coords', []))
-    db_exec("INSERT INTO floor_plans (id, building_id, floor, name, desc, coords) VALUES (?,?,?,?,?,?)",
-            (obj['id'], obj['building_id'], obj['floor'], obj['name'], obj['desc'], coords_json))
 
 def delete_building_from_db(id):
     db_exec("DELETE FROM buildings WHERE id = ?", (id,))
-
-
-def delete_plans_for_building(building_id):
-    db_exec("DELETE FROM floor_plans WHERE building_id = ?", (building_id,))
-
-
-def delete_plan(plan_id):
-    db_exec("DELETE FROM floor_plans WHERE id = ?", (plan_id,))
 
 def cleanup_db_dangers(cutoff):
     conn = sqlite3.connect(DB_FILE)
@@ -277,8 +228,6 @@ def save_tokens():
         pass
 
 init_db()
-ensure_buildings_have_floors_column()
-ensure_floor_plans_table()
 load_data_from_db()
 load_tokens()
 
@@ -546,9 +495,6 @@ HTML_TEMPLATE = """
         .pulse { width: 14px; height: 14px; background: #10b981; border: 3px solid #fff; border-radius: 50%; box-shadow: 0 0 0 rgba(16,185,129,0.4); animation: p 2s infinite; }
         .other { width: 10px; height: 10px; background: #333; border: 2px solid #fff; border-radius: 50%; }
         .build-icon { border: 2px solid #fff; width: 14px; height: 14px; border-radius: 3px; box-shadow: 0 2px 5px rgba(0,0,0,0.3); }
-        .floor-buttons { display: flex; gap: 6px; flex-wrap: wrap; }
-        .floor-btn { min-width: 32px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 10px; background: #fff; font-weight: 700; cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,0.2); color: #333; }
-        .floor-btn.active { background: var(--p); color: #fff; border-color: var(--p); }
         @keyframes p { 0% { box-shadow: 0 0 0 0 rgba(16,185,129,0.7); } 70% { box-shadow: 0 0 0 10px transparent; } }
         .leaflet-control-layers { border-radius: 12px; border: none; box-shadow: 0 4px 10px rgba(0,0,0,0.2); font-family: 'Inter'; font-weight: 600; }
         
@@ -593,11 +539,6 @@ HTML_TEMPLATE = """
     <div class="ui-panel">
         <div id="legend-content"></div>
         <div style="margin-top:5px; color:#888;">Live Sync</div>
-        <div id="floor-panel" style="margin-top:10px; display:none;">
-            <div style="font-weight:700; margin-bottom:4px;">План этажа</div>
-            <select id="building-select" style="margin-bottom:6px;"></select>
-            <div id="floor-buttons" class="floor-buttons"></div>
-        </div>
     </div>
 
 <div class="tools-panel">
@@ -621,18 +562,6 @@ HTML_TEMPLATE = """
         <input id="b-name" placeholder="Название">
         <select id="b-type"></select>
         <input id="b-desc" placeholder="Описание">
-        <input id="b-floors" type="number" min="1" step="1" placeholder="Этажность (число)">
-        <div id="save-as" style="display:none; background:#f5f5f5; padding:8px; border-radius:10px; font-size:12px; text-align:left;">
-            <div style="font-weight:700; margin-bottom:6px;">Что сохраняем?</div>
-            <label style="display:block; margin-bottom:4px;"><input type="radio" name="save-as" value="building" checked> Контур здания / зоны</label>
-            <label style="display:block; margin-bottom:8px;"><input type="radio" name="save-as" value="room"> Комната (планировка)</label>
-            <div id="room-fields" style="display:none;">
-                <select id="room-building" style="margin-bottom:6px;"></select>
-                <input id="room-floor" type="number" min="1" step="1" placeholder="Этаж">
-                <input id="room-name" placeholder="Название комнаты">
-                <input id="room-desc" placeholder="Описание комнаты">
-            </div>
-        </div>
     </div>
 
     <div class="actions">
@@ -651,15 +580,12 @@ HTML_TEMPLATE = """
     const CATS = {{ categories|tojson }};
     
     let map;
-    let markers = { users: {}, dangers: [], buildings: [], polygons: [], rooms: [] };
+    let markers = { users: {}, dangers: [], buildings: [], polygons: [] };
     let tempCoords = null;
     let activeMode = 'danger';
     let isAuth = false;
     let isPolySaveMode = false;
     let rulerMode = false, rulerPoints = [], rulerLine = null, rulerPopup = null;
-    let floorPlans = [];
-    let selectedBuildingId = null;
-    let selectedFloor = 1;
     let currentBuildings = [];
 
     function setC(n,v){ document.cookie=n+"="+v+";path=/;max-age=7200"; }
@@ -686,63 +612,6 @@ HTML_TEMPLATE = """
         const bSel = document.getElementById('b-type');
         bSel.innerHTML = '';
         CATS.building.forEach(c => bSel.innerHTML += `<option value="${c.id}">${c.name}</option>`);
-        initFloorSelectors();
-        bindSaveAsRadios();
-    }
-
-    function initFloorSelectors() {
-        if (!IS_DEBUG) return;
-        const buildingSelect = document.getElementById('building-select');
-        buildingSelect.onchange = () => {
-            selectedBuildingId = buildingSelect.value || null;
-            selectedFloor = 1;
-            syncFloorControls();
-            renderFloorPlans();
-        };
-    }
-
-    function bindSaveAsRadios() {
-        const radios = document.querySelectorAll('input[name="save-as"]');
-        radios.forEach(r => {
-            r.onchange = () => toggleRoomFields(r.value === 'room');
-        });
-    }
-
-    function toggleRoomFields(show) {
-        const roomFields = document.getElementById('room-fields');
-        roomFields.style.display = show ? 'block' : 'none';
-    }
-
-    function prepareSaveAsSection() {
-        const saveAs = document.getElementById('save-as');
-        if (IS_DEBUG && rulerPoints.length > 2) {
-            saveAs.style.display = 'block';
-        } else {
-            saveAs.style.display = 'none';
-        }
-        const radios = document.querySelectorAll('input[name="save-as"]');
-        radios.forEach(r => { r.checked = r.value === 'building'; });
-        toggleRoomFields(false);
-        updateRoomBuildingOptions();
-        document.getElementById('room-floor').value = selectedFloor;
-    }
-
-    function updateRoomBuildingOptions() {
-        if (!IS_DEBUG) return;
-        const select = document.getElementById('room-building');
-        select.innerHTML = '';
-        currentBuildings.forEach(b => {
-            const opt = document.createElement('option');
-            opt.value = b.id;
-            opt.text = `${b.name || 'Без названия'} (ID: ${b.id.slice(0,4)})`;
-            select.appendChild(opt);
-        });
-        if (selectedBuildingId) select.value = selectedBuildingId;
-    }
-
-    function getSaveMode() {
-        const selected = document.querySelector('input[name="save-as"]:checked');
-        return selected ? selected.value : 'building';
     }
 
     function loadFile(inp) {
@@ -835,7 +704,6 @@ HTML_TEMPLATE = """
         list.forEach(b => {
             let col = getColor(b.type, 'building');
             let popupContent = `<b>🏢 ${b.name}</b><br>${b.desc||''}`;
-            if (b.floors) popupContent += `<br>Этажей: ${b.floors}`;
             if (IS_DEBUG) popupContent += `<br><button onclick="deleteObject('${b.id}')" style="margin-top:5px;background:#e74c3c;color:white;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;width:100%;font-size:11px;">Удалить</button>`;
 
             if (b.coords && b.coords.length > 2) {
@@ -852,14 +720,6 @@ HTML_TEMPLATE = """
                 markers.buildings.push(m);
             }
         });
-        updateBuildingSelector();
-        renderFloorPlans();
-    });
-
-    socket.on('update_floor_plans', (list) => {
-        if(!isAuth) return;
-        floorPlans = list;
-        renderFloorPlans();
     });
 
     window.setMode = function(m) {
@@ -879,122 +739,23 @@ HTML_TEMPLATE = """
         document.getElementById('modal').classList.add('open');
     }
     window.submitItem = function() {
-        const floors = getFloorsValue();
         if (isPolySaveMode) {
             const center = rulerLine.getBounds().getCenter();
-            if (getSaveMode() === 'room') {
-                const targetBuilding = document.getElementById('room-building').value || selectedBuildingId;
-                const floor = parseInt(document.getElementById('room-floor').value || selectedFloor, 10) || 1;
-                const roomName = document.getElementById('room-name').value || 'Комната';
-                const roomDesc = document.getElementById('room-desc').value || '';
-                socket.emit('add_room', { building_id: targetBuilding, floor, name: roomName, desc: roomDesc, coords: rulerPoints });
-            } else {
-                socket.emit('add_building', { lat: center.lat, lng: center.lng, name: document.getElementById('b-name').value || 'Зона', type: document.getElementById('b-type').value, desc: document.getElementById('b-desc').value, coords: rulerPoints, floors });
-            }
+            socket.emit('add_building', { lat: center.lat, lng: center.lng, name: document.getElementById('b-name').value || 'Зона', type: document.getElementById('b-type').value, desc: document.getElementById('b-desc').value, coords: rulerPoints });
             toggleRuler();
         } else {
             if(!tempCoords) return;
             if(activeMode === 'danger') {
                 socket.emit('add_danger', { lat: tempCoords.lat, lng: tempCoords.lng, type: document.getElementById('d-type').value, desc: document.getElementById('d-desc').value });
             } else {
-                socket.emit('add_building', { lat: tempCoords.lat, lng: tempCoords.lng, name: document.getElementById('b-name').value || 'Здание', type: document.getElementById('b-type').value, desc: document.getElementById('b-desc').value, floors });
+                socket.emit('add_building', { lat: tempCoords.lat, lng: tempCoords.lng, name: document.getElementById('b-name').value || 'Здание', type: document.getElementById('b-type').value, desc: document.getElementById('b-desc').value });
             }
         }
         closeModal();
     }
 
-    function getFloorsValue() {
-        const raw = document.getElementById('b-floors').value;
-        if (!raw) return null;
-        const parsed = parseInt(raw, 10);
-        return Number.isNaN(parsed) ? null : parsed;
-    }
-
     window.deleteObject = function(id) {
         if(confirm("Удалить объект?")) socket.emit('delete_building', { id: id });
-    }
-
-    window.deleteRoom = function(id) {
-        if(confirm("Удалить комнату?")) socket.emit('delete_room', { id });
-    }
-
-    function updateBuildingSelector() {
-        if (!IS_DEBUG) return;
-        const panel = document.getElementById('floor-panel');
-        const buildingSelect = document.getElementById('building-select');
-        buildingSelect.innerHTML = '';
-        const multiFloorBuildings = currentBuildings.filter(b => (b.floors || 1) > 1);
-        if (!multiFloorBuildings.length) {
-            panel.style.display = 'none';
-            selectedBuildingId = null;
-            return;
-        }
-        panel.style.display = 'block';
-        multiFloorBuildings.forEach(b => {
-            const opt = document.createElement('option');
-            opt.value = b.id;
-            opt.text = b.name || 'Без названия';
-            buildingSelect.appendChild(opt);
-        });
-        if (!selectedBuildingId || !multiFloorBuildings.find(b => b.id === selectedBuildingId)) {
-            selectedBuildingId = multiFloorBuildings[0].id;
-        }
-        buildingSelect.value = selectedBuildingId;
-        syncFloorControls();
-        updateRoomBuildingOptions();
-    }
-
-    function syncFloorControls() {
-        const floorButtons = document.getElementById('floor-buttons');
-        floorButtons.innerHTML = '';
-        const building = currentBuildings.find(b => b.id === selectedBuildingId);
-        const maxFloors = building && building.floors ? Math.max(1, building.floors) : 1;
-        selectedFloor = Math.min(selectedFloor || 1, maxFloors);
-        if (maxFloors <= 1) {
-            floorButtons.style.display = 'none';
-            document.getElementById('room-floor').value = selectedFloor;
-            return;
-        }
-        floorButtons.style.display = 'flex';
-        for (let i = 1; i <= maxFloors; i++) {
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = `floor-btn${i === selectedFloor ? ' active' : ''}`;
-            btn.textContent = i;
-            btn.dataset.floor = i;
-            btn.onclick = () => {
-                selectedFloor = i;
-                setActiveFloorButton(floorButtons, i);
-                document.getElementById('room-floor').value = selectedFloor;
-                renderFloorPlans();
-            };
-            floorButtons.appendChild(btn);
-        }
-        document.getElementById('room-floor').value = selectedFloor;
-    }
-
-    function setActiveFloorButton(container, floor) {
-        container.querySelectorAll('.floor-btn').forEach(btn => {
-            btn.classList.toggle('active', Number(btn.dataset.floor) === Number(floor));
-        });
-    }
-
-    function renderFloorPlans() {
-        if (!map || !IS_DEBUG) return;
-        markers.rooms.forEach(l => map.removeLayer(l));
-        markers.rooms = [];
-        if (!selectedBuildingId) return;
-        const building = currentBuildings.find(b => b.id === selectedBuildingId);
-        const baseColor = building ? getColor(building.type, 'building') : '#555';
-        floorPlans
-            .filter(p => p.building_id === selectedBuildingId && Number(p.floor) === Number(selectedFloor))
-            .forEach(p => {
-                const poly = L.polygon(p.coords || [], { color: baseColor, weight: 2, fillColor: baseColor, fillOpacity: 0.25 }).addTo(map);
-                let popupContent = `<b>Комната: ${p.name}</b><br>${p.desc || ''}<br>Этаж: ${p.floor}`;
-                if (IS_DEBUG) popupContent += `<br><button onclick="deleteRoom('${p.id}')" style="margin-top:5px;background:#e74c3c;color:white;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;width:100%;font-size:11px;">Удалить</button>`;
-                poly.bindPopup(popupContent);
-                markers.rooms.push(poly);
-            });
     }
 
     window.toggleRuler = function() {
@@ -1065,7 +826,6 @@ def on_login(d):
         emit('update_users', users)
         emit('update_dangers', dangers)
         emit('update_buildings', buildings)
-        emit('update_floor_plans', floor_plans)
     else:
         emit('login_response', {'success': False})
 
@@ -1079,7 +839,6 @@ def on_restore(d):
         emit('update_users', users)
         emit('update_dangers', dangers)
         emit('update_buildings', buildings)
-        emit('update_floor_plans', floor_plans)
     else:
         emit('restore_response', {'success': False})
 
@@ -1106,45 +865,15 @@ def on_add_building(d):
     if not DEBUG_MODE:
         return
     if request.sid in sessions:
-        floors = d.get('floors')
-        try:
-            floors = int(floors) if floors is not None else None
-        except (ValueError, TypeError):
-            floors = None
         obj = {
             'id': str(uuid.uuid4()),
             'lat': d['lat'], 'lng': d['lng'],
             'name': d['name'], 'type': d['type'], 'desc': d['desc'],
-            'coords': d.get('coords', []),
-            'floors': floors
+            'coords': d.get('coords', [])
         }
         buildings.append(obj)
         add_building_to_db(obj)
         emit('update_buildings', buildings, broadcast=True)
-        emit('update_floor_plans', floor_plans, broadcast=True)
-
-
-@socketio.on('add_room')
-def on_add_room(d):
-    if not DEBUG_MODE:
-        return
-    if request.sid in sessions:
-        global floor_plans
-        try:
-            floor_value = int(d.get('floor') or 1)
-        except (TypeError, ValueError):
-            floor_value = 1
-        obj = {
-            'id': str(uuid.uuid4()),
-            'building_id': d.get('building_id'),
-            'floor': floor_value,
-            'name': d.get('name') or 'Комната',
-            'desc': d.get('desc'),
-            'coords': d.get('coords', [])
-        }
-        floor_plans.append(obj)
-        add_plan_to_db(obj)
-        emit('update_floor_plans', floor_plans, broadcast=True)
 
 
 @socketio.on('delete_building')
@@ -1155,22 +884,8 @@ def on_delete_building(d):
     bid = d.get('id')
     buildings = [b for b in buildings if b['id'] != bid]
     delete_building_from_db(bid)
-    delete_plans_for_building(bid)
-    global floor_plans
-    floor_plans = [p for p in floor_plans if p.get('building_id') != bid]
     emit('update_buildings', buildings, broadcast=True)
-    emit('update_floor_plans', floor_plans, broadcast=True)
-
-
-@socketio.on('delete_room')
-def on_delete_room(d):
-    if not DEBUG_MODE:
-        return
-    global floor_plans
-    rid = d.get('id')
-    floor_plans = [p for p in floor_plans if p.get('id') != rid]
-    delete_plan(rid)
-    emit('update_floor_plans', floor_plans, broadcast=True)
+    
 
 
 # DEBUG HANDLERS
