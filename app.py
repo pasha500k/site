@@ -546,6 +546,9 @@ HTML_TEMPLATE = """
         .pulse { width: 14px; height: 14px; background: #10b981; border: 3px solid #fff; border-radius: 50%; box-shadow: 0 0 0 rgba(16,185,129,0.4); animation: p 2s infinite; }
         .other { width: 10px; height: 10px; background: #333; border: 2px solid #fff; border-radius: 50%; }
         .build-icon { border: 2px solid #fff; width: 14px; height: 14px; border-radius: 3px; box-shadow: 0 2px 5px rgba(0,0,0,0.3); }
+        .floor-buttons { display: flex; gap: 6px; flex-wrap: wrap; }
+        .floor-btn { min-width: 32px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 10px; background: #fff; font-weight: 700; cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,0.2); color: #333; }
+        .floor-btn.active { background: var(--p); color: #fff; border-color: var(--p); }
         @keyframes p { 0% { box-shadow: 0 0 0 0 rgba(16,185,129,0.7); } 70% { box-shadow: 0 0 0 10px transparent; } }
         .leaflet-control-layers { border-radius: 12px; border: none; box-shadow: 0 4px 10px rgba(0,0,0,0.2); font-family: 'Inter'; font-weight: 600; }
         
@@ -587,15 +590,15 @@ HTML_TEMPLATE = """
     <img src="/logo.png" alt="Логотип">
 </div>
 
-<div class="ui-panel">
-    <div id="legend-content"></div>
-    <div style="margin-top:5px; color:#888;">Live Sync</div>
-    <div id="floor-panel" style="margin-top:10px; display:none;">
-        <div style="font-weight:700; margin-bottom:4px;">План этажа</div>
-        <select id="building-select" style="margin-bottom:6px;"></select>
-        <select id="floor-select"></select>
+    <div class="ui-panel">
+        <div id="legend-content"></div>
+        <div style="margin-top:5px; color:#888;">Live Sync</div>
+        <div id="floor-panel" style="margin-top:10px; display:none;">
+            <div style="font-weight:700; margin-bottom:4px;">План этажа</div>
+            <select id="building-select" style="margin-bottom:6px;"></select>
+            <div id="floor-buttons" class="floor-buttons"></div>
+        </div>
     </div>
-</div>
 
 <div class="tools-panel">
     <div class="tool-btn" id="ruler-btn" onclick="toggleRuler()" title="Рулетка"><i class="fas fa-ruler-combined"></i></div>
@@ -690,14 +693,10 @@ HTML_TEMPLATE = """
     function initFloorSelectors() {
         if (!IS_DEBUG) return;
         const buildingSelect = document.getElementById('building-select');
-        const floorSelect = document.getElementById('floor-select');
         buildingSelect.onchange = () => {
             selectedBuildingId = buildingSelect.value || null;
-            syncFloorSelect();
-            renderFloorPlans();
-        };
-        floorSelect.onchange = () => {
-            selectedFloor = parseInt(floorSelect.value, 10) || 1;
+            selectedFloor = 1;
+            syncFloorControls();
             renderFloorPlans();
         };
     }
@@ -923,40 +922,61 @@ HTML_TEMPLATE = """
         if (!IS_DEBUG) return;
         const panel = document.getElementById('floor-panel');
         const buildingSelect = document.getElementById('building-select');
-        const floorSelect = document.getElementById('floor-select');
         buildingSelect.innerHTML = '';
-        if (!currentBuildings.length) {
+        const multiFloorBuildings = currentBuildings.filter(b => (b.floors || 1) > 1);
+        if (!multiFloorBuildings.length) {
             panel.style.display = 'none';
+            selectedBuildingId = null;
             return;
         }
         panel.style.display = 'block';
-        currentBuildings.forEach(b => {
+        multiFloorBuildings.forEach(b => {
             const opt = document.createElement('option');
             opt.value = b.id;
             opt.text = b.name || 'Без названия';
             buildingSelect.appendChild(opt);
         });
-        if (!selectedBuildingId || !currentBuildings.find(b => b.id === selectedBuildingId)) {
-            selectedBuildingId = currentBuildings[0].id;
+        if (!selectedBuildingId || !multiFloorBuildings.find(b => b.id === selectedBuildingId)) {
+            selectedBuildingId = multiFloorBuildings[0].id;
         }
         buildingSelect.value = selectedBuildingId;
-        syncFloorSelect();
+        syncFloorControls();
         updateRoomBuildingOptions();
     }
 
-    function syncFloorSelect() {
-        const floorSelect = document.getElementById('floor-select');
-        floorSelect.innerHTML = '';
+    function syncFloorControls() {
+        const floorButtons = document.getElementById('floor-buttons');
+        floorButtons.innerHTML = '';
         const building = currentBuildings.find(b => b.id === selectedBuildingId);
         const maxFloors = building && building.floors ? Math.max(1, building.floors) : 1;
         selectedFloor = Math.min(selectedFloor || 1, maxFloors);
-        for (let i = 1; i <= maxFloors; i++) {
-            const opt = document.createElement('option');
-            opt.value = i;
-            opt.text = `${i} этаж`;
-            floorSelect.appendChild(opt);
+        if (maxFloors <= 1) {
+            floorButtons.style.display = 'none';
+            document.getElementById('room-floor').value = selectedFloor;
+            return;
         }
-        floorSelect.value = selectedFloor;
+        floorButtons.style.display = 'flex';
+        for (let i = 1; i <= maxFloors; i++) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = `floor-btn${i === selectedFloor ? ' active' : ''}`;
+            btn.textContent = i;
+            btn.dataset.floor = i;
+            btn.onclick = () => {
+                selectedFloor = i;
+                setActiveFloorButton(floorButtons, i);
+                document.getElementById('room-floor').value = selectedFloor;
+                renderFloorPlans();
+            };
+            floorButtons.appendChild(btn);
+        }
+        document.getElementById('room-floor').value = selectedFloor;
+    }
+
+    function setActiveFloorButton(container, floor) {
+        container.querySelectorAll('.floor-btn').forEach(btn => {
+            btn.classList.toggle('active', Number(btn.dataset.floor) === Number(floor));
+        });
     }
 
     function renderFloorPlans() {
