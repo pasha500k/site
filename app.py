@@ -86,6 +86,7 @@ categories_config = {
     'building': []
 }
 access_codes = []
+floor_plans = []
 
 current_daily_code = ""
 current_date_str = ""
@@ -103,6 +104,8 @@ def init_db():
                  (id TEXT PRIMARY KEY, lat REAL, lng REAL, type TEXT, desc TEXT, ts REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS buildings
                  (id TEXT PRIMARY KEY, lat REAL, lng REAL, name TEXT, type TEXT, desc TEXT, coords TEXT, floors INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS floor_plans
+                 (id TEXT PRIMARY KEY, building_id TEXT, floor INTEGER, name TEXT, desc TEXT, coords TEXT)''')
 
     # Настройки категорий
     c.execute('''CREATE TABLE IF NOT EXISTS categories
@@ -129,6 +132,15 @@ def ensure_buildings_have_floors_column():
         conn.commit()
     conn.close()
 
+
+def ensure_floor_plans_table():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS floor_plans
+                 (id TEXT PRIMARY KEY, building_id TEXT, floor INTEGER, name TEXT, desc TEXT, coords TEXT)''')
+    conn.commit()
+    conn.close()
+
 def check_defaults():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -149,7 +161,7 @@ def check_defaults():
     conn.close()
 
 def load_data_from_db():
-    global dangers, buildings, categories_config, access_codes
+    global dangers, buildings, categories_config, access_codes, floor_plans
     try:
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -184,6 +196,19 @@ def load_data_from_db():
         # Обновляем глобальный список
         access_codes = custom_codes
 
+        # Планировки этажей
+        c.execute("SELECT * FROM floor_plans")
+        raw_plans = c.fetchall()
+        floor_plans = []
+        for row in raw_plans:
+            p = dict(row)
+            if p.get('coords'):
+                try:
+                    p['coords'] = json.loads(p['coords'])
+                except Exception:
+                    p['coords'] = []
+            floor_plans.append(p)
+
         conn.close()
     except Exception as e:
         print(f"[DB ERROR] Load failed: {e}")
@@ -209,8 +234,22 @@ def add_building_to_db(obj):
     db_exec("INSERT INTO buildings (id, lat, lng, name, type, desc, coords, floors) VALUES (?,?,?,?,?,?,?,?)",
             (obj['id'], obj['lat'], obj['lng'], obj['name'], obj['type'], obj['desc'], coords_json, obj.get('floors')))
 
+
+def add_plan_to_db(obj):
+    coords_json = json.dumps(obj.get('coords', []))
+    db_exec("INSERT INTO floor_plans (id, building_id, floor, name, desc, coords) VALUES (?,?,?,?,?,?)",
+            (obj['id'], obj['building_id'], obj['floor'], obj['name'], obj['desc'], coords_json))
+
 def delete_building_from_db(id):
     db_exec("DELETE FROM buildings WHERE id = ?", (id,))
+
+
+def delete_plans_for_building(building_id):
+    db_exec("DELETE FROM floor_plans WHERE building_id = ?", (building_id,))
+
+
+def delete_plan(plan_id):
+    db_exec("DELETE FROM floor_plans WHERE id = ?", (plan_id,))
 
 def cleanup_db_dangers(cutoff):
     conn = sqlite3.connect(DB_FILE)
@@ -239,6 +278,7 @@ def save_tokens():
 
 init_db()
 ensure_buildings_have_floors_column()
+ensure_floor_plans_table()
 load_data_from_db()
 load_tokens()
 
@@ -550,6 +590,11 @@ HTML_TEMPLATE = """
 <div class="ui-panel">
     <div id="legend-content"></div>
     <div style="margin-top:5px; color:#888;">Live Sync</div>
+    <div id="floor-panel" style="margin-top:10px; display:none;">
+        <div style="font-weight:700; margin-bottom:4px;">План этажа</div>
+        <select id="building-select" style="margin-bottom:6px;"></select>
+        <select id="floor-select"></select>
+    </div>
 </div>
 
 <div class="tools-panel">
@@ -574,6 +619,17 @@ HTML_TEMPLATE = """
         <select id="b-type"></select>
         <input id="b-desc" placeholder="Описание">
         <input id="b-floors" type="number" min="1" step="1" placeholder="Этажность (число)">
+        <div id="save-as" style="display:none; background:#f5f5f5; padding:8px; border-radius:10px; font-size:12px; text-align:left;">
+            <div style="font-weight:700; margin-bottom:6px;">Что сохраняем?</div>
+            <label style="display:block; margin-bottom:4px;"><input type="radio" name="save-as" value="building" checked> Контур здания / зоны</label>
+            <label style="display:block; margin-bottom:8px;"><input type="radio" name="save-as" value="room"> Комната (планировка)</label>
+            <div id="room-fields" style="display:none;">
+                <select id="room-building" style="margin-bottom:6px;"></select>
+                <input id="room-floor" type="number" min="1" step="1" placeholder="Этаж">
+                <input id="room-name" placeholder="Название комнаты">
+                <input id="room-desc" placeholder="Описание комнаты">
+            </div>
+        </div>
     </div>
 
     <div class="actions">
@@ -592,12 +648,16 @@ HTML_TEMPLATE = """
     const CATS = {{ categories|tojson }};
     
     let map;
-    let markers = { users: {}, dangers: [], buildings: [], polygons: [] };
+    let markers = { users: {}, dangers: [], buildings: [], polygons: [], rooms: [] };
     let tempCoords = null;
     let activeMode = 'danger';
     let isAuth = false;
     let isPolySaveMode = false;
     let rulerMode = false, rulerPoints = [], rulerLine = null, rulerPopup = null;
+    let floorPlans = [];
+    let selectedBuildingId = null;
+    let selectedFloor = 1;
+    let currentBuildings = [];
 
     function setC(n,v){ document.cookie=n+"="+v+";path=/;max-age=7200"; }
     function getC(n){ let m=document.cookie.match(new RegExp("(^| )"+n+"=([^;]+)")); return m?m[2]:null; }
@@ -623,6 +683,67 @@ HTML_TEMPLATE = """
         const bSel = document.getElementById('b-type');
         bSel.innerHTML = '';
         CATS.building.forEach(c => bSel.innerHTML += `<option value="${c.id}">${c.name}</option>`);
+        initFloorSelectors();
+        bindSaveAsRadios();
+    }
+
+    function initFloorSelectors() {
+        if (!IS_DEBUG) return;
+        const buildingSelect = document.getElementById('building-select');
+        const floorSelect = document.getElementById('floor-select');
+        buildingSelect.onchange = () => {
+            selectedBuildingId = buildingSelect.value || null;
+            syncFloorSelect();
+            renderFloorPlans();
+        };
+        floorSelect.onchange = () => {
+            selectedFloor = parseInt(floorSelect.value, 10) || 1;
+            renderFloorPlans();
+        };
+    }
+
+    function bindSaveAsRadios() {
+        const radios = document.querySelectorAll('input[name="save-as"]');
+        radios.forEach(r => {
+            r.onchange = () => toggleRoomFields(r.value === 'room');
+        });
+    }
+
+    function toggleRoomFields(show) {
+        const roomFields = document.getElementById('room-fields');
+        roomFields.style.display = show ? 'block' : 'none';
+    }
+
+    function prepareSaveAsSection() {
+        const saveAs = document.getElementById('save-as');
+        if (IS_DEBUG && rulerPoints.length > 2) {
+            saveAs.style.display = 'block';
+        } else {
+            saveAs.style.display = 'none';
+        }
+        const radios = document.querySelectorAll('input[name="save-as"]');
+        radios.forEach(r => { r.checked = r.value === 'building'; });
+        toggleRoomFields(false);
+        updateRoomBuildingOptions();
+        document.getElementById('room-floor').value = selectedFloor;
+    }
+
+    function updateRoomBuildingOptions() {
+        if (!IS_DEBUG) return;
+        const select = document.getElementById('room-building');
+        select.innerHTML = '';
+        currentBuildings.forEach(b => {
+            const opt = document.createElement('option');
+            opt.value = b.id;
+            opt.text = `${b.name || 'Без названия'} (ID: ${b.id.slice(0,4)})`;
+            select.appendChild(opt);
+        });
+        if (selectedBuildingId) select.value = selectedBuildingId;
+    }
+
+    function getSaveMode() {
+        const selected = document.querySelector('input[name="save-as"]:checked');
+        return selected ? selected.value : 'building';
     }
 
     function loadFile(inp) {
@@ -707,6 +828,7 @@ HTML_TEMPLATE = """
 
     socket.on('update_buildings', (list) => {
         if(!isAuth) return;
+        currentBuildings = list;
         markers.buildings.forEach(l => map.removeLayer(l));
         markers.polygons.forEach(l => map.removeLayer(l));
         markers.buildings = [];
@@ -731,6 +853,14 @@ HTML_TEMPLATE = """
                 markers.buildings.push(m);
             }
         });
+        updateBuildingSelector();
+        renderFloorPlans();
+    });
+
+    socket.on('update_floor_plans', (list) => {
+        if(!isAuth) return;
+        floorPlans = list;
+        renderFloorPlans();
     });
 
     window.setMode = function(m) {
@@ -753,7 +883,15 @@ HTML_TEMPLATE = """
         const floors = getFloorsValue();
         if (isPolySaveMode) {
             const center = rulerLine.getBounds().getCenter();
-            socket.emit('add_building', { lat: center.lat, lng: center.lng, name: document.getElementById('b-name').value || 'Зона', type: document.getElementById('b-type').value, desc: document.getElementById('b-desc').value, coords: rulerPoints, floors });
+            if (getSaveMode() === 'room') {
+                const targetBuilding = document.getElementById('room-building').value || selectedBuildingId;
+                const floor = parseInt(document.getElementById('room-floor').value || selectedFloor, 10) || 1;
+                const roomName = document.getElementById('room-name').value || 'Комната';
+                const roomDesc = document.getElementById('room-desc').value || '';
+                socket.emit('add_room', { building_id: targetBuilding, floor, name: roomName, desc: roomDesc, coords: rulerPoints });
+            } else {
+                socket.emit('add_building', { lat: center.lat, lng: center.lng, name: document.getElementById('b-name').value || 'Зона', type: document.getElementById('b-type').value, desc: document.getElementById('b-desc').value, coords: rulerPoints, floors });
+            }
             toggleRuler();
         } else {
             if(!tempCoords) return;
@@ -772,17 +910,79 @@ HTML_TEMPLATE = """
         const parsed = parseInt(raw, 10);
         return Number.isNaN(parsed) ? null : parsed;
     }
-    
+
     window.deleteObject = function(id) {
         if(confirm("Удалить объект?")) socket.emit('delete_building', { id: id });
+    }
+
+    window.deleteRoom = function(id) {
+        if(confirm("Удалить комнату?")) socket.emit('delete_room', { id });
+    }
+
+    function updateBuildingSelector() {
+        if (!IS_DEBUG) return;
+        const panel = document.getElementById('floor-panel');
+        const buildingSelect = document.getElementById('building-select');
+        const floorSelect = document.getElementById('floor-select');
+        buildingSelect.innerHTML = '';
+        if (!currentBuildings.length) {
+            panel.style.display = 'none';
+            return;
+        }
+        panel.style.display = 'block';
+        currentBuildings.forEach(b => {
+            const opt = document.createElement('option');
+            opt.value = b.id;
+            opt.text = b.name || 'Без названия';
+            buildingSelect.appendChild(opt);
+        });
+        if (!selectedBuildingId || !currentBuildings.find(b => b.id === selectedBuildingId)) {
+            selectedBuildingId = currentBuildings[0].id;
+        }
+        buildingSelect.value = selectedBuildingId;
+        syncFloorSelect();
+        updateRoomBuildingOptions();
+    }
+
+    function syncFloorSelect() {
+        const floorSelect = document.getElementById('floor-select');
+        floorSelect.innerHTML = '';
+        const building = currentBuildings.find(b => b.id === selectedBuildingId);
+        const maxFloors = building && building.floors ? Math.max(1, building.floors) : 1;
+        selectedFloor = Math.min(selectedFloor || 1, maxFloors);
+        for (let i = 1; i <= maxFloors; i++) {
+            const opt = document.createElement('option');
+            opt.value = i;
+            opt.text = `${i} этаж`;
+            floorSelect.appendChild(opt);
+        }
+        floorSelect.value = selectedFloor;
+    }
+
+    function renderFloorPlans() {
+        if (!map || !IS_DEBUG) return;
+        markers.rooms.forEach(l => map.removeLayer(l));
+        markers.rooms = [];
+        if (!selectedBuildingId) return;
+        const building = currentBuildings.find(b => b.id === selectedBuildingId);
+        const baseColor = building ? getColor(building.type, 'building') : '#555';
+        floorPlans
+            .filter(p => p.building_id === selectedBuildingId && Number(p.floor) === Number(selectedFloor))
+            .forEach(p => {
+                const poly = L.polygon(p.coords || [], { color: baseColor, weight: 2, fillColor: baseColor, fillOpacity: 0.25 }).addTo(map);
+                let popupContent = `<b>Комната: ${p.name}</b><br>${p.desc || ''}<br>Этаж: ${p.floor}`;
+                if (IS_DEBUG) popupContent += `<br><button onclick="deleteRoom('${p.id}')" style="margin-top:5px;background:#e74c3c;color:white;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;width:100%;font-size:11px;">Удалить</button>`;
+                poly.bindPopup(popupContent);
+                markers.rooms.push(poly);
+            });
     }
 
     window.toggleRuler = function() {
         rulerMode = !rulerMode;
         const btn = document.getElementById('ruler-btn');
         const saveBtn = document.getElementById('save-poly-btn');
-        if(rulerMode) { btn.classList.add('active'); rulerPoints = []; clearRulerLayers(); } 
-        else { btn.classList.remove('active'); saveBtn.style.display = 'none'; clearRulerLayers(); rulerPoints = []; }
+        if(rulerMode) { btn.classList.add('active'); rulerPoints = []; clearRulerLayers(); }
+        else { btn.classList.remove('active'); saveBtn.style.display = 'none'; clearRulerLayers(); rulerPoints = []; isPolySaveMode = false; }
     }
     function clearRulerLayers() { if(rulerLine) map.removeLayer(rulerLine); if(rulerPopup) map.removeLayer(rulerPopup); }
     function handleRulerClick(latlng) {
@@ -845,6 +1045,7 @@ def on_login(d):
         emit('update_users', users)
         emit('update_dangers', dangers)
         emit('update_buildings', buildings)
+        emit('update_floor_plans', floor_plans)
     else:
         emit('login_response', {'success': False})
 
@@ -858,6 +1059,7 @@ def on_restore(d):
         emit('update_users', users)
         emit('update_dangers', dangers)
         emit('update_buildings', buildings)
+        emit('update_floor_plans', floor_plans)
     else:
         emit('restore_response', {'success': False})
 
@@ -899,6 +1101,30 @@ def on_add_building(d):
         buildings.append(obj)
         add_building_to_db(obj)
         emit('update_buildings', buildings, broadcast=True)
+        emit('update_floor_plans', floor_plans, broadcast=True)
+
+
+@socketio.on('add_room')
+def on_add_room(d):
+    if not DEBUG_MODE:
+        return
+    if request.sid in sessions:
+        global floor_plans
+        try:
+            floor_value = int(d.get('floor') or 1)
+        except (TypeError, ValueError):
+            floor_value = 1
+        obj = {
+            'id': str(uuid.uuid4()),
+            'building_id': d.get('building_id'),
+            'floor': floor_value,
+            'name': d.get('name') or 'Комната',
+            'desc': d.get('desc'),
+            'coords': d.get('coords', [])
+        }
+        floor_plans.append(obj)
+        add_plan_to_db(obj)
+        emit('update_floor_plans', floor_plans, broadcast=True)
 
 
 @socketio.on('delete_building')
@@ -909,7 +1135,22 @@ def on_delete_building(d):
     bid = d.get('id')
     buildings = [b for b in buildings if b['id'] != bid]
     delete_building_from_db(bid)
+    delete_plans_for_building(bid)
+    global floor_plans
+    floor_plans = [p for p in floor_plans if p.get('building_id') != bid]
     emit('update_buildings', buildings, broadcast=True)
+    emit('update_floor_plans', floor_plans, broadcast=True)
+
+
+@socketio.on('delete_room')
+def on_delete_room(d):
+    if not DEBUG_MODE:
+        return
+    global floor_plans
+    rid = d.get('id')
+    floor_plans = [p for p in floor_plans if p.get('id') != rid]
+    delete_plan(rid)
+    emit('update_floor_plans', floor_plans, broadcast=True)
 
 
 # DEBUG HANDLERS
