@@ -102,7 +102,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS dangers
                  (id TEXT PRIMARY KEY, lat REAL, lng REAL, type TEXT, desc TEXT, ts REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS buildings
-                 (id TEXT PRIMARY KEY, lat REAL, lng REAL, name TEXT, type TEXT, desc TEXT, coords TEXT)''')
+                 (id TEXT PRIMARY KEY, lat REAL, lng REAL, name TEXT, type TEXT, desc TEXT, coords TEXT, floors INTEGER)''')
 
     # Настройки категорий
     c.execute('''CREATE TABLE IF NOT EXISTS categories
@@ -117,6 +117,17 @@ def init_db():
 
     # Загружаем дефолтные категории, если пусто
     check_defaults()
+
+
+def ensure_buildings_have_floors_column():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("PRAGMA table_info(buildings)")
+    cols = [row[1] for row in c.fetchall()]
+    if 'floors' not in cols:
+        c.execute("ALTER TABLE buildings ADD COLUMN floors INTEGER")
+        conn.commit()
+    conn.close()
 
 def check_defaults():
     conn = sqlite3.connect(DB_FILE)
@@ -195,8 +206,8 @@ def add_danger_to_db(obj):
 
 def add_building_to_db(obj):
     coords_json = json.dumps(obj.get('coords', []))
-    db_exec("INSERT INTO buildings (id, lat, lng, name, type, desc, coords) VALUES (?,?,?,?,?,?,?)",
-            (obj['id'], obj['lat'], obj['lng'], obj['name'], obj['type'], obj['desc'], coords_json))
+    db_exec("INSERT INTO buildings (id, lat, lng, name, type, desc, coords, floors) VALUES (?,?,?,?,?,?,?,?)",
+            (obj['id'], obj['lat'], obj['lng'], obj['name'], obj['type'], obj['desc'], coords_json, obj.get('floors')))
 
 def delete_building_from_db(id):
     db_exec("DELETE FROM buildings WHERE id = ?", (id,))
@@ -227,6 +238,7 @@ def save_tokens():
         pass
 
 init_db()
+ensure_buildings_have_floors_column()
 load_data_from_db()
 load_tokens()
 
@@ -561,6 +573,7 @@ HTML_TEMPLATE = """
         <input id="b-name" placeholder="Название">
         <select id="b-type"></select>
         <input id="b-desc" placeholder="Описание">
+        <input id="b-floors" type="number" min="1" step="1" placeholder="Этажность (число)">
     </div>
 
     <div class="actions">
@@ -701,6 +714,7 @@ HTML_TEMPLATE = """
         list.forEach(b => {
             let col = getColor(b.type, 'building');
             let popupContent = `<b>🏢 ${b.name}</b><br>${b.desc||''}`;
+            if (b.floors) popupContent += `<br>Этажей: ${b.floors}`;
             if (IS_DEBUG) popupContent += `<br><button onclick="deleteObject('${b.id}')" style="margin-top:5px;background:#e74c3c;color:white;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;width:100%;font-size:11px;">Удалить</button>`;
 
             if (b.coords && b.coords.length > 2) {
@@ -736,19 +750,27 @@ HTML_TEMPLATE = """
         document.getElementById('modal').classList.add('open');
     }
     window.submitItem = function() {
+        const floors = getFloorsValue();
         if (isPolySaveMode) {
             const center = rulerLine.getBounds().getCenter();
-            socket.emit('add_building', { lat: center.lat, lng: center.lng, name: document.getElementById('b-name').value || 'Зона', type: document.getElementById('b-type').value, desc: document.getElementById('b-desc').value, coords: rulerPoints });
-            toggleRuler(); 
+            socket.emit('add_building', { lat: center.lat, lng: center.lng, name: document.getElementById('b-name').value || 'Зона', type: document.getElementById('b-type').value, desc: document.getElementById('b-desc').value, coords: rulerPoints, floors });
+            toggleRuler();
         } else {
             if(!tempCoords) return;
             if(activeMode === 'danger') {
                 socket.emit('add_danger', { lat: tempCoords.lat, lng: tempCoords.lng, type: document.getElementById('d-type').value, desc: document.getElementById('d-desc').value });
             } else {
-                socket.emit('add_building', { lat: tempCoords.lat, lng: tempCoords.lng, name: document.getElementById('b-name').value || 'Здание', type: document.getElementById('b-type').value, desc: document.getElementById('b-desc').value });
+                socket.emit('add_building', { lat: tempCoords.lat, lng: tempCoords.lng, name: document.getElementById('b-name').value || 'Здание', type: document.getElementById('b-type').value, desc: document.getElementById('b-desc').value, floors });
             }
         }
         closeModal();
+    }
+
+    function getFloorsValue() {
+        const raw = document.getElementById('b-floors').value;
+        if (!raw) return null;
+        const parsed = parseInt(raw, 10);
+        return Number.isNaN(parsed) ? null : parsed;
     }
     
     window.deleteObject = function(id) {
@@ -862,11 +884,17 @@ def on_add_building(d):
     if not DEBUG_MODE:
         return
     if request.sid in sessions:
+        floors = d.get('floors')
+        try:
+            floors = int(floors) if floors is not None else None
+        except (ValueError, TypeError):
+            floors = None
         obj = {
             'id': str(uuid.uuid4()),
             'lat': d['lat'], 'lng': d['lng'],
             'name': d['name'], 'type': d['type'], 'desc': d['desc'],
-            'coords': d.get('coords', [])
+            'coords': d.get('coords', []),
+            'floors': floors
         }
         buildings.append(obj)
         add_building_to_db(obj)
