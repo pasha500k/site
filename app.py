@@ -478,7 +478,7 @@ HTML_TEMPLATE = """
         .logo { position: absolute; top: 20px; left: 20px; z-index: 1000; }
         .logo img { height: 50px; width: auto; }
         .tools-panel { position: absolute; top: 80px; left: 20px; z-index: 1000; display: flex; flex-direction: column; gap: 10px; }
-        .tool-btn { width: 44px; height: 44px; background: var(--w); border-radius: 10px; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 10px rgba(0,0,0,0.2); cursor: pointer; color: #333; font-size: 18px; transition: 0.2s; }
+        .tool-btn { width: 48px; height: 48px; background: var(--w); border-radius: 12px; display: flex; align-items: center; justify-content: center; box-shadow: 0 6px 14px rgba(0,0,0,0.18); cursor: pointer; color: #333; font-size: 18px; transition: 0.2s; touch-action: manipulation; }
         .tool-btn.active { background: var(--p); color: #fff; }
         #save-poly-btn { display: none; background: #2ecc71; color: white; animation: popIn 0.3s; }
         @keyframes popIn { from { transform: scale(0); } to { transform: scale(1); } }
@@ -490,6 +490,7 @@ HTML_TEMPLATE = """
         input, select { width: 100%; padding: 14px; margin-bottom: 10px; border-radius: 10px; border: 1px solid #ccc; box-sizing: border-box; }
         .actions { display: flex; gap: 10px; margin-top: 10px; }
         .ui-panel { position: absolute; top: 20px; right: 20px; background: var(--g); padding: 10px 15px; border-radius: 12px; z-index: 1000; font-size: 12px; backdrop-filter: blur(10px); }
+        .hint { margin-top: 6px; color: #555; font-size: 11px; line-height: 1.2; }
         .legend-item { display: flex; align-items: center; margin-bottom: 5px; }
         .dot { width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
         .pulse { width: 14px; height: 14px; background: #10b981; border: 3px solid #fff; border-radius: 50%; box-shadow: 0 0 0 rgba(16,185,129,0.4); animation: p 2s infinite; }
@@ -508,6 +509,15 @@ HTML_TEMPLATE = """
             font-weight: 600;
             text-shadow: 0 0 2px rgba(255,255,255,0.8);
             pointer-events: none;
+        }
+
+        @media (max-width: 640px) {
+            .card { padding: 22px; border-radius: 20px; }
+            .btn { font-size: 16px; }
+            .tools-panel { top: auto; bottom: 20px; left: 50%; transform: translateX(-50%); flex-direction: row; }
+            .ui-panel { top: auto; bottom: 90px; right: 12px; }
+            #modal { padding: 20px; }
+            .hint { font-size: 12px; }
         }
     </style>
 </head>
@@ -536,10 +546,11 @@ HTML_TEMPLATE = """
     <img src="/logo.png" alt="Логотип">
 </div>
 
-    <div class="ui-panel">
-        <div id="legend-content"></div>
-        <div style="margin-top:5px; color:#888;">Live Sync</div>
-    </div>
+<div class="ui-panel">
+    <div id="legend-content"></div>
+    <div style="margin-top:5px; color:#888;">Live Sync</div>
+    <div class="hint">Два коротких нажатия добавляют постоянную точку.</div>
+</div>
 
 <div class="tools-panel">
     <div class="tool-btn" id="ruler-btn" onclick="toggleRuler()" title="Рулетка"><i class="fas fa-ruler-combined"></i></div>
@@ -587,6 +598,7 @@ HTML_TEMPLATE = """
     let isPolySaveMode = false;
     let rulerMode = false, rulerPoints = [], rulerLine = null, rulerPopup = null;
     let currentBuildings = [];
+    let lastTap = 0;
 
     function setC(n,v){ document.cookie=n+"="+v+";path=/;max-age=7200"; }
     function getC(n){ let m=document.cookie.match(new RegExp("(^| )"+n+"=([^;]+)")); return m?m[2]:null; }
@@ -645,18 +657,30 @@ HTML_TEMPLATE = """
         if(map) return;
         const streets = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', { maxZoom: 19 });
         const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19 });
-        map = L.map('map', {zoomControl:false, attributionControl:false, layers: [streets]}).setView([55.75, 37.61], 13);
+        map = L.map('map', {zoomControl:false, attributionControl:false, layers: [streets], doubleClickZoom:false}).setView([55.75, 37.61], 13);
         if (IS_DEBUG) L.control.layers({"Карта": streets, "Спутник": satellite}, null, {position: 'topright'}).addTo(map);
         map.on('click', (e) => {
-            if (rulerMode) handleRulerClick(e.latlng);
-            else {
-                isPolySaveMode = false;
-                tempCoords = e.latlng;
-                document.getElementById('modal-title').innerText = "Добавить объект";
-                document.getElementById('modal-tabs').style.display = 'flex';
-                setMode('danger');
-                document.getElementById('modal').classList.add('open');
+            const now = Date.now();
+            const isDouble = now - lastTap < 350;
+            lastTap = now;
+
+            if (rulerMode) {
+                handleRulerClick(e.latlng);
+                return;
             }
+
+            isPolySaveMode = false;
+            tempCoords = e.latlng;
+            document.getElementById('modal-title').innerText = "Добавить объект";
+            document.getElementById('modal-tabs').style.display = 'flex';
+
+            if (isDouble && IS_DEBUG) {
+                setMode('building');
+            } else {
+                setMode('danger');
+            }
+
+            document.getElementById('modal').classList.add('open');
         });
     }
 
